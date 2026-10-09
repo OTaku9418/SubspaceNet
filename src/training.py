@@ -470,7 +470,7 @@ def plot_learning_curve(epoch_list, train_loss: list, validation_loss: list):
     plt.xlabel("Epochs")
     plt.ylabel("Loss")
     plt.legend(loc="best")
-    plt.show()
+    plt.tight_layout()
 
 
 def simulation_summary(

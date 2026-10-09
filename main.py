@@ -42,7 +42,7 @@ plt.close("all")
 
 if __name__ == "__main__":
     # Initialize paths
-    external_data_path = Path.cwd() / "data"
+    external_data_path = Path(__file__).resolve().parent / "data"
     scenario_data_path = "uniform_bias_spacing"
     datasets_path = external_data_path / "datasets" / scenario_data_path
     simulations_path = external_data_path / "simulations"
@@ -51,9 +51,9 @@ if __name__ == "__main__":
     datasets_path.mkdir(parents=True, exist_ok=True)
     (datasets_path / "train").mkdir(parents=True, exist_ok=True)
     (datasets_path / "test").mkdir(parents=True, exist_ok=True)
-    datasets_path.mkdir(parents=True, exist_ok=True)
-    simulations_path.mkdir(parents=True, exist_ok=True)
-    saving_path.mkdir(parents=True, exist_ok=True)
+    (simulations_path / "results" / "scores").mkdir(parents=True, exist_ok=True)
+    (simulations_path / "results" / "plots").mkdir(parents=True, exist_ok=True)
+    (saving_path / "final_models").mkdir(parents=True, exist_ok=True)
     # Initialize time and date
     now = datetime.now()
     dt_string = now.strftime("%d/%m/%Y %H:%M:%S")
@@ -61,11 +61,11 @@ if __name__ == "__main__":
     # Operations commands
     commands = {
         "SAVE_TO_FILE": True,  # Saving results to file or present them over CMD
-        "CREATE_DATA": False,  # Creating new dataset
-        "LOAD_DATA": True,  # Loading data from exist dataset
-        "LOAD_MODEL": True,  # Load specific model for training
+        "CREATE_DATA": True,  # Creating new dataset
+        "LOAD_DATA": False,  # Loading data from exist dataset
+        "LOAD_MODEL": False,  # Load specific model for training
         "TRAIN_MODEL": True,  # Applying training operation
-        "SAVE_MODEL": False,  # Saving tuned model
+        "SAVE_MODEL": True,  # Saving tuned model
         "EVALUATE_MODE": True,  # Evaluating desired algorithms
     }
     # Saving simulation scores to external file
@@ -91,7 +91,7 @@ if __name__ == "__main__":
     model_config = (
         ModelGenerator()
         .set_model_type("SubspaceNet")
-        .set_diff_method("esprit")
+        .set_diff_method("root_music")
         .set_tau(8)
         .set_model(system_model_params)
     )
@@ -193,11 +193,12 @@ if __name__ == "__main__":
             )
         # Plots saving
         if commands["SAVE_TO_FILE"]:
-            plt.savefig(
+            plt.gcf().savefig(
                 simulations_path
                 / "results"
                 / "plots"
-                / Path(dt_string_for_save + r".png")
+                / Path(dt_string_for_save + r".png"),
+                bbox_inches="tight",
             )
         else:
             plt.show()

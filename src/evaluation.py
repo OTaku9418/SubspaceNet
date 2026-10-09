@@ -196,7 +196,7 @@ def evaluate_augmented_model(
                 # If the amount of predictions is less than the amount of sources
                 predictions = add_random_predictions(M, predictions, algorithm)
                 # Calculate loss criterion
-                loss = criterion(predictions, DOA * R2D)
+                loss = criterion(predictions, DOA.detach().cpu().numpy() * R2D)
                 hybrid_loss.append(loss)
             else:
                 hybrid_loss.append(0)
@@ -207,7 +207,7 @@ def evaluate_augmented_model(
                     figures[algorithm]["norm factor"] = np.max(spectrum)
                     plot_spectrum(
                         predictions=predictions,
-                        true_DOA=DOA * R2D,
+                        true_DOA=DOA.detach().cpu().numpy() * R2D,
                         system_model=system_model,
                         spectrum=spectrum,
                         algorithm="SubNet+" + algorithm.upper(),
@@ -245,7 +245,13 @@ def evaluate_model_based(
     loss_list = []
     for i, data in enumerate(dataset):
         X, doa = data
-        X = X[0]
+        X = X[0]    
+        if hasattr(X, "detach"):
+            X = X.detach().cpu().numpy()
+
+        if hasattr(doa, "detach"):
+            doa = doa.detach().cpu().numpy()
+
         # Root-MUSIC algorithms
         if "r-music" in algorithm:
             root_music = RootMUSIC(system_model)
