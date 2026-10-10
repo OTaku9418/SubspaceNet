@@ -265,6 +265,26 @@ def gram_diagonal_overload(Kx: torch.Tensor, eps: float, batch_size: int):
     if not isinstance(Kx, torch.Tensor):
         Kx = torch.tensor(Kx)
 
+    # Batched Hermitian conjecture: for every sample, K^H @ K. Note that this is the
+    # conjugate transpose times the matrix (not K @ K^H), matching the original loop below:
+    #   Kx_garm = torch.matmul(torch.t(torch.conj(K)), K)
+    Kx_gram = torch.matmul(Kx.conj().transpose(-2, -1), Kx).to(device)
+    # Batched diagonal loading: eps on every diagonal element, via eye() instead of
+    # materializing a diagonal matrix per sample.
+    n = Kx_gram.shape[-1]
+    eye = torch.eye(n, device=device, dtype=Kx_gram.dtype)
+    return Kx_gram + eps * eye
+
+
+def gram_diagonal_overload_reference(Kx: torch.Tensor, eps: float, batch_size: int):
+    """Original per-sample implementation of :func:`gram_diagonal_overload`.
+
+    Kept verbatim (apart from a leading underscore-free name) so that the batched version
+    above can be checked against it. See verify_batched_ops.py.
+    """
+    if not isinstance(Kx, torch.Tensor):
+        Kx = torch.tensor(Kx)
+
     Kx_list = []
     bs_kx = Kx
     for iter in range(batch_size):

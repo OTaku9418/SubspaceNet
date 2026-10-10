@@ -973,10 +973,53 @@ batch=1024  forward 206.6 ms/step   step 1468.9 ms/step   吞吐 696.9 样本/s
 
 改动梯度路径意味着**最终 RMSPE 会有微小偏移**，所以换用这个版本后请重跑一次 `--smoke --force_data`，对照 §13.5 的表确认量级没变（η=0.025 时 SubNet+r-music ≈ 25.28°、r-music ≈ 4.07°）。已生成的数据集与权重格式不变，可以继续复用。
 
-### 16.7 还没做的项（按性价比排序）
+### 16.7 改动三：`gram_diagonal_overload` 也是逐样本循环（`src/utils.py:247-279`）
 
-1. **`esprit` 分支**（`src/models.py:818`）是同样的逐样本循环，且仍在调用有 CPU 回退的 `src/utils.py:147` `find_roots_torch`。论文主结果用的是 `root_music`，所以没动它；若你要用 `--diff_method esprit` 训练，需要同样处理。
-2. 两个评估用 DataLoader 加 `num_workers=4, pin_memory=True`（`reproduce_array_mismatch.py:710-711`）。注意数据是**内存里的张量列表**，不是磁盘 I/O，这项收益有限。
-3. `src/training.py:437` 每个 best epoch 都会 `copy.deepcopy(model.state_dict())`；改成存盘 + 结束回读可省一份拷贝峰值。模型只有 0.17 MB，收益也很小。
+这一处最容易被忽略：它**不在** `src/models.py` 里，而在 `src/utils.py`，从 `SubspaceNet.forward` 的最后一步调用。原实现：
+
+```python
+for iter in range(batch_size):
+    K = bs_kx[iter]
+    Kx_garm = torch.matmul(torch.t(torch.conj(K)), K).to(device)   # 每样本一次 matmul
+    eps_addition = (eps * torch.diag(torch.ones(Kx_garm.shape[0]))).to(device)
+    Rz = Kx_garm + eps_addition
+    Kx_list.append(Rz)
+```
+
+batch=512 就是 512 次 `conj`+`transpose`+`matmul`+`diag`+`matmul`+`stack`，每次都 `.to(device)`。现在：
+
+```python
+Kx_gram = torch.matmul(Kx.conj().transpose(-2, -1), Kx).to(device)
+eye = torch.eye(Kx_gram.shape[-1], device=device, dtype=Kx_gram.dtype)
+return Kx_gram + eps * eye
+```
+
+**注意这里是 `K^H K`（共轭转置在左）**，不是 `K K^H`，改写时别顺手"纠正"。实测：batch 512 时 **57.21 ms → 0.093 ms（612 倍）**，完整 forward **96.5 ms → 28.9 ms（3.3 倍）**。等价性见 §16.6 的 `verify_batched_ops.py`（batch 1/8/512 最大差 3.8e-6）。
+
+**教训（值得记）**：这个仓库的"逐样本 Python 循环"不止一处，而且分布在不同文件里。批量化的顺序应该是**从 profiler 的头号算子往下查**，而不是从自己以为的热点开始——`root_music` 看起来最可疑（又是求根又是 EVD），但 `gram_diagonal_overload` 才是第一个该动的（它只占 2 个 matmul，容易被当成"已经很便宜了"）。用 `python profile_forward.py` 一次就能看到。
+
+### 16.8 还没做的项（按性价比排序）
+
+1. **`src/utils.py:128` `find_roots_torch`**：伴随矩阵建在 CPU 上（§16.2 的陷阱）。现在只有 `esprit` 分支（`src/models.py:818`）还在用它，`root_music` 已经改用 `find_roots_batched`。若你要用 `--diff_method esprit` 训练，需要同样处理。
+2. **`torch.linalg.eig` → `torch.linalg.eigh`**：`F = U_n U_n^H` 一定是 Hermitian，而实测 `eigh` 比 `eig` 快 **33 倍**（batch 512：7.95 ms → 0.24 ms）。但没有直接替换，原因写在下面。
+3. 两个评估用 DataLoader 加 `num_workers=4, pin_memory=True`（`reproduce_array_mismatch.py:710-711`）。注意数据是**内存里的张量列表**，不是磁盘 I/O，这项收益有限。
+4. `src/training.py:437` 每个 best epoch 都会 `copy.deepcopy(model.state_dict())`；改成存盘 + 结束回读可省一份拷贝峰值。模型只有 0.17 MB，收益很小。
+
+> **为什么没有把 `eig` 换成 `eigh`**：`root_music` 现在用 `torch.linalg.eig(Rz)` 对**非 Hermitian** 的预测协方差做特征分解，再按 `|λ|` 排序取噪声子空间。换成 `eigh` 需要先把 `Rz` 对称化，而 `eigh` 在**特征值简并**时会返回简并子空间内的任意正交基——此时 `U_n` 会整体旋转，`F` 随之改变（随机复矩阵上实测 `F` 差了 1.6）。理论上只要简并集合**整个**落在噪声子空间、且不与信号特征值简并，`U_n` 张成的子空间就唯一、`F` 不变，DoA 也就相同；但实测 `|λ₁|-|λ₂|` 的最小值只有 4.6e-5（即确实会碰到近似简并），所以这不是纯理论问题。要换需要先用真实模型输出验证 DoA 逐样本一致，**目前没做，也没有必要**——`eig` 只占 forward 的 4.2 ms / 28.9 ms。
+
+### 16.9 完整的提速账（RTX 4060 Laptop，batch 512）
+
+| 阶段 | 原始 | 现在 | 倍数 |
+|---|---|---|---|
+| `gram_diagonal_overload` | 57.21 ms | 0.093 ms | 612× |
+| `root_music` | ≈ 1670 ms（按 batch 512 外推） | 24.1 ms | ≈ 69× |
+| 完整 forward | 96.5 ms | 28.9 ms | 3.3× |
+| **整步训练** | 1112 ms/step | **535.6 ms/step** | **2.1×** |
+| 吞吐 | 663 样本/s | **956 样本/s** | 1.4× |
+| 推算论文规模每 epoch | ≈ 64 s | **≈ 44 s** | 1.5× |
+
+（`root_music` 的"原始"列取自 `verify_batched_ops.py` 里按 16 样本外推的值；`gram` 与整步来自本机实测。）
+
+到这一步，**剩下的大头是反向传播本身**：forward 只占 29 ms，而整步要 535 ms。所以再想提速得换思路（混合精度、或者减少 `root_music` 反向的代价），不是继续找循环了。
 
 

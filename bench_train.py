@@ -19,12 +19,14 @@
 
 参考值 (RTX 4060 Laptop, torch 2.0.1+cu118, T=100, N=8, tau=8):
     数据生成    1.008 ms/样本
-    batch=2     forward 3.8 ms/step   step 12.6 ms/step   吞吐 158.5 样本/s
-    batch=512   forward 105 ms/step   step 772 ms/step    吞吐 662.8 样本/s
-    batch=1024  forward 207 ms/step   step 1469 ms/step   吞吐 696.9 样本/s
+    batch=2     forward 3.8 ms/step    step 12.6 ms/step   吞吐 158.5 样本/s
+    batch=512   forward 29.4 ms/step   step 535.6 ms/step  吞吐 955.6 样本/s
+    batch=1024  forward 58.4 ms/step   step 1060.0 ms/step 吞吐 965.6 样本/s
+    推算论文规模 (40500 训练 + 4500 验证) 约 44 s/epoch
 
 如果某项比参考值慢 5 倍以上, 基本可以断定不是"卡慢", 而是那一段落到了 CPU、
-或者被 JIT/同步拖住 —— 请把完整输出发回来。
+或者被 JIT/同步拖住 —— 请把完整输出发回来。慢在 forward 里的话再跑
+`python profile_forward.py`, 它会指出具体是哪个模块。
 """
 
 import argparse

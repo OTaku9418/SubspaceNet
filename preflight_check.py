@@ -377,6 +377,29 @@ def _root_music_equivalence():
     )
     return f"batch 1/8/32 上最大偏差 {worst:.3e} rad（容差 1e-4）"
 
+
+@check("gram_diagonal_overload 的批量实现与逐样本原始实现等价")
+def _gram_equivalence():
+    """src/utils.py 的 gram_diagonal_overload 原本是逐样本循环（文档 §16.8）。"""
+    import torch
+    from src.utils import (device, gram_diagonal_overload,
+                           gram_diagonal_overload_reference)
+
+    worst = 0.0
+    for batch_size in (1, 8, 64):
+        Kx = (
+            torch.randn(batch_size, 8, 8, dtype=torch.complex64, device=device)
+            + 1j * torch.randn(batch_size, 8, 8, dtype=torch.complex64, device=device)
+        )
+        new = gram_diagonal_overload(Kx, 1.0, batch_size)
+        ref = gram_diagonal_overload_reference(Kx, 1.0, batch_size)
+        worst = max(worst, (new - ref).abs().max().item())
+    assert worst < 1e-4, (
+        f"批量版 gram_diagonal_overload 与原始实现的最大偏差 {worst:.3e} 超出容差 1e-4。"
+        "运行 `python verify_batched_ops.py` 查看明细。"
+    )
+    return f"batch 1/8/64 上最大偏差 {worst:.3e}（容差 1e-4）"
+
 # ------------------------------------------------------------------------------
 print()
 print("[5] 端到端训练（可选，--full）")
