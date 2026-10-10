@@ -333,11 +333,12 @@ def _shared_doa():
 
 @check("root_music 的批量实现与逐样本原始实现等价")
 def _root_music_equivalence():
-    """src/models.py:744 的 root_music 已批量化（见文档 §16）。
+    """src/models.py 的 root_music 已批量化（见文档 §16）。
 
     这里做一次最小等价性验证：用 verify_root_music_batch.py 里内联保留的原始逐样本实现，
     在同样的输入上比对 M 个 doa 与全部根 doa 的集合。训练会反传穿过这个函数，所以
-    "批量化改坏了数值" 是最需要被自动抓住的回归。
+    "批量化改坏了数值" 是最需要被自动抓住的回归。两个实现都走 eigh（见下面那一项），
+    所以这里校验的是"批量化"这一件事本身。
     """
     import torch
     from src.models import ModelGenerator, root_music
@@ -380,7 +381,7 @@ def _root_music_equivalence():
 
 @check("gram_diagonal_overload 的批量实现与逐样本原始实现等价")
 def _gram_equivalence():
-    """src/utils.py 的 gram_diagonal_overload 原本是逐样本循环（文档 §16.8）。"""
+    """src/utils.py 的 gram_diagonal_overload 原本是逐样本循环（文档 §16.7）。"""
     import torch
     from src.utils import (device, gram_diagonal_overload,
                            gram_diagonal_overload_reference)
@@ -399,6 +400,111 @@ def _gram_equivalence():
         "运行 `python verify_batched_ops.py` 查看明细。"
     )
     return f"batch 1/8/64 上最大偏差 {worst:.3e}（容差 1e-4）"
+
+
+@check("esprit 的批量实现与逐样本原始实现等价（仅 esprit 分支）")
+def _esprit_equivalence():
+    """src/models.py 的 esprit 原本是逐样本循环（文档 §16.9）。
+
+    本复现用 diff_method="root_music"，不走这条路；这条断言是为了让"改动没改坏
+    数值"这件事在换机器/换 torch 版本后仍能一键复验。
+    """
+    from verify_esprit_batch import esprit_reference
+
+    import torch
+    from src.models import ModelGenerator, esprit
+    from src.system_model import SystemModelParams
+    from src.utils import device, set_unified_seed
+
+    set_unified_seed(0)
+    params = SystemModelParams()
+    for name, value in dict(
+        N=8, M=2, T=100, snr=10, eta=0.0, bias=0.0,
+        signal_type="NarrowBand", signal_nature="non-coherent",
+    ).items():
+        params.set_parameter(name, value)
+    model = (
+        ModelGenerator().set_model_type("SubspaceNet")
+        .set_diff_method("esprit").set_tau(8).set_model(params)
+    ).model.to(device).eval()
+
+    worst = 0.0
+    for batch_size in (1, 8, 32):
+        x = torch.randn(batch_size, 8, 16, 8, device=device)
+        with torch.no_grad():
+            Rz = model(x)[-1].detach()
+            ref = esprit_reference(Rz, 2, batch_size)
+            new = esprit(Rz, 2, batch_size)
+        # 逐样本比 M 个 doa：两个实现的排列都可能受特征值退化影响，故比排序后的集合。
+        diff = (
+            torch.sort(ref, dim=-1).values - torch.sort(new, dim=-1).values
+        ).abs().max().item()
+        worst = max(worst, diff)
+    assert worst < 1e-3, (
+        f"批量版 esprit 与原始实现的最大偏差 {worst:.3e} rad 超出容差 1e-3。"
+        "运行 `python verify_esprit_batch.py` 查看明细。"
+    )
+    return f"batch 1/8/32 上 M 个 doa 最大偏差 {worst:.3e} rad（容差 1e-3）"
+
+
+@check("替代协方差是 Hermitian 的，且 eigh 给出正交的噪声子空间投影")
+def _hermitian():
+    """src/models.py:root_music 用 eigh 而不是 eig，前提是 Rz = K^H K + eps*I 为 Hermitian。
+
+    这条断言校验两件事：
+      1. 前提成立 —— 替代协方差确实 Hermitian（否则 eigh 会静默给出错误结果）；
+      2. 噪声子空间投影 F = Un Un^H 确实是**正交投影**（幂等）。
+
+    第 2 条才是换 eigh 的实质理由，不只是快：float32 下 `torch.linalg.eig` 返回的特征向量
+    并不正交（实测 ||V^H V - I|| = 3.8e-4），于是 F 也不是幂等的（实测 1.4e-4），连带
+    Root-MUSIC 的多项式系数与 DoA 都被扰动到这个量级；`eigh` 两个指标都在 1e-6。
+    这也是为什么不同求根路径的 DoA 会有 1e-3 度量级的差异（见文档 §16）。
+    """
+    import torch
+    from src.models import ModelGenerator
+    from src.system_model import SystemModelParams
+    from src.utils import set_unified_seed
+
+    set_unified_seed(0)
+    p = (SystemModelParams().set_parameter("N", 8).set_parameter("M", 2)
+         .set_parameter("T", 100).set_parameter("snr", 10)
+         .set_parameter("signal_type", "NarrowBand")
+         .set_parameter("signal_nature", "non-coherent")
+         .set_parameter("eta", 0.0).set_parameter("bias", 0.0)
+         .set_parameter("sv_noise_var", 0.0))
+    model = (ModelGenerator().set_model_type("SubspaceNet")
+             .set_diff_method("root_music").set_tau(8).set_model(p)).model
+    model = model.to("cuda" if torch.cuda.is_available() else "cpu").eval()
+    dev = next(model.parameters()).device
+
+    x = torch.randn(32, 8, 16, 8, device=dev)
+    with torch.no_grad():
+        Rz = model(x)[-1].detach()
+    skew = (Rz - Rz.conj().transpose(-2, -1)).abs().max().item()
+
+    herm = (Rz + Rz.conj().transpose(-2, -1)) / 2
+    with torch.no_grad():
+        ev_eig, V_eig = torch.linalg.eig(herm)
+        order = torch.argsort(torch.abs(ev_eig), dim=1, descending=True)
+        V_eig = torch.gather(V_eig, 2, order.unsqueeze(1).expand(-1, 8, -1))
+        _, V_eigh = torch.linalg.eigh(herm)
+        V_eigh = torch.flip(V_eigh, dims=[-1])
+        eye = torch.eye(8, dtype=herm.dtype, device=dev).expand_as(V_eigh @ V_eigh)
+        ortho_eig = (V_eig.conj().transpose(-2, -1) @ V_eig - eye).abs().max().item()
+        ortho_eigh = (V_eigh.conj().transpose(-2, -1) @ V_eigh - eye).abs().max().item()
+        F_eigh = V_eigh[:, :, 2:] @ V_eigh[:, :, 2:].conj().transpose(-2, -1)
+        idem = (F_eigh @ F_eigh - F_eigh).abs().max().item()
+
+    assert skew < 1e-5, (
+        f"替代协方差的 Hermitian 偏差 {skew:.3e} 过大，eigh 的前提不成立——"
+        "请检查 src/models.py 的 gram_diagonal_overload 调用。"
+    )
+    assert idem < 1e-5, (
+        f"eigh 给出的噪声子空间投影不幂等（偏差 {idem:.3e}），超出容差 1e-5。"
+    )
+    return (f"Hermitian 偏差 {skew:.1e}；eigh 投影幂等偏差 {idem:.1e}；"
+            f"正交性 eig {ortho_eig:.1e} vs eigh {ortho_eigh:.1e}")
+
 
 # ------------------------------------------------------------------------------
 print()

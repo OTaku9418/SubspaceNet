@@ -960,13 +960,13 @@ python bench_train.py --batch 2 256 1024    # 对比不同 batch 的每样本成
 python bench_train.py --device cpu          # 排除"其实跑在 CPU 上"
 ```
 
-本机（4060）参考输出：
+本机（4060）参考输出（eigh + 全部批量化**之后**）：
 
 ```
-数据生成  2000 样本 2.02 s  (1.008 ms/样本)
-batch=2     forward   3.8 ms/step   step   12.6 ms/step   吞吐 158.5 样本/s
-batch=512   forward 105.1 ms/step   step  772.3 ms/step   吞吐 662.8 样本/s
-batch=1024  forward 206.6 ms/step   step 1468.9 ms/step   吞吐 696.9 样本/s
+数据生成  2000 样本 1.84 s  (0.920 ms/样本)
+batch=2     forward   2.3 ms/step   step    9.6 ms/step   吞吐  206.9 样本/s
+batch=512   forward  21.7 ms/step   step  488.8 ms/step   吞吐 1047.0 样本/s
+batch=1024  forward  41.0 ms/step   step  968.8 ms/step   吞吐 1056.5 样本/s
 ```
 
 判读方法：如果 `forward ÷ step`、或者每样本成本与上表的比例关系明显不对（例如 batch=512 的 step 超过 3 秒，或 batch=2 与 batch=512 的每样本成本差不多），说明瓶颈**不在** `root_music`，而在别处（数据搬运、验证集、或落到了 CPU）——把这三种 batch 的完整输出发回来即可定位。
@@ -1000,28 +1000,77 @@ return Kx_gram + eps * eye
 
 **顺带修掉的一个死代码 bug**：`gram_diagonal_overload` 的签名要求 `batch_size`，但 `DeepRootMUSIC.forward`（`src/models.py:255`，改写前）调用它时**没传**，且同一个 `forward` 还在读一个从未赋值的 `self.M`（`src/models.py:258`）。也就是说 **`DeepRootMUSIC` 这个模型从来没能跑过一次**——两次调用都会抛异常。已修：`batch_size` 改为可选（默认从 `Kx.shape[0]` 推断），`DeepRootMUSIC.__init__` 增加 `M: int = 2` 参数。它与本复现无关（`ModelGenerator` 构造不出这个模型），但既然在同一行上，就一并修掉并记在这里。
 
-### 16.8 还没做的项（按性价比排序）
 
-1. **`src/utils.py:128` `find_roots_torch`**：伴随矩阵建在 CPU 上（§16.2 的陷阱）。现在只有 `esprit` 分支（`src/models.py:818`）还在用它，`root_music` 已经改用 `find_roots_batched`。若你要用 `--diff_method esprit` 训练，需要同样处理。
-2. **`torch.linalg.eig` → `torch.linalg.eigh`**：`F = U_n U_n^H` 一定是 Hermitian，而实测 `eigh` 比 `eig` 快 **33 倍**（batch 512：7.95 ms → 0.24 ms）。但没有直接替换，原因写在下面。
-3. 两个评估用 DataLoader 加 `num_workers=4, pin_memory=True`（`reproduce_array_mismatch.py:710-711`）。注意数据是**内存里的张量列表**，不是磁盘 I/O，这项收益有限。
-4. `src/training.py:437` 每个 best epoch 都会 `copy.deepcopy(model.state_dict())`；改成存盘 + 结束回读可省一份拷贝峰值。模型只有 0.17 MB，收益很小。
+### 16.8 改动四：`eig` → `eigh`（`src/models.py` 的 `root_music`）
 
-> **为什么没有把 `eig` 换成 `eigh`**：`root_music` 现在用 `torch.linalg.eig(Rz)` 对**非 Hermitian** 的预测协方差做特征分解，再按 `|λ|` 排序取噪声子空间。换成 `eigh` 需要先把 `Rz` 对称化，而 `eigh` 在**特征值简并**时会返回简并子空间内的任意正交基——此时 `U_n` 会整体旋转，`F` 随之改变（随机复矩阵上实测 `F` 差了 1.6）。理论上只要简并集合**整个**落在噪声子空间、且不与信号特征值简并，`U_n` 张成的子空间就唯一、`F` 不变，DoA 也就相同；但实测 `|λ₁|-|λ₂|` 的最小值只有 4.6e-5（即确实会碰到近似简并），所以这不是纯理论问题。要换需要先用真实模型输出验证 DoA 逐样本一致，**目前没做，也没有必要**——`eig` 只占 forward 的 4.2 ms / 28.9 ms。
+**这一节纠正了本文档早先自己的一个判断。** 早先这里写的是"不要换 `eigh`，因为特征值简并时噪声子空间会旋转"——那时只看到"`F` 会变"就下了结论，**没有去查变得对不对**。补做的三项测量把结论推翻了：
 
-### 16.9 完整的提速账（RTX 4060 Laptop，batch 512）
+| 测量（batch 512，本机） | `eig` | `eigh` |
+|---|---|---|
+| 8×8 特征分解耗时 | 7.40 ms | **0.24 ms（31×）** |
+| 特征向量正交性 `‖V^H V − I‖` | 3.8e-04 | **1.8e-06** |
+| 噪声投影 `F = U_n U_n^H` 的幂等偏差 `‖F² − F‖` | 1.4e-04 | **1.1e-06** |
 
-| 阶段 | 原始 | 现在 | 倍数 |
+也就是说：`eig` 在 float32 下返回的特征向量**根本不正交**，`F` 本来就不是一个合法的投影矩阵。`U_n` 的"旋转"不是 `eigh` 引入的问题，而是 `eig` 把它算错了。`eigh` 走 Hermitian 专用例程，两个精度指标都好了三个数量级，顺带还快 31 倍（通用求解器在小批量 8×8 上的 CUDA 路径本来就是 CPU-bound，见 §16.1）。
+
+改动很小：
+
+```python
+eigenvalues, eigenvectors = torch.linalg.eigh(Rz)
+eigenvalues = torch.flip(eigenvalues, dims=[-1])       # eigh 返回升序
+eigenvectors = torch.flip(eigenvectors, dims=[-1])
+n = Rz.shape[-1]
+Un = eigenvectors[:, :, M:]
+```
+
+**前提在数值上成立**：`eigh` 要求 Hermitian，而 `Rz` 并不严格是。但实测 `‖Rz − Rz^H‖_max = 2.4e-07`（相对 `‖Rz‖` 是 float32 舍入量级），即"它是 Hermitian"这件事不是假设。`torch.linalg.eigh` 只读下三角，等于隐式对称化。`preflight_check.py` 已加一项断言（§16.10）。
+
+**DoA 不变**：单元级 `max|ΔDoA| = 1.1e-03` 度；端到端跑 `--smoke --force_data` 后六个 RMSPE 与 §13.5 **逐位相同**（25.282 / 4.069 / 25.341 / 5.019 / 26.471 / 8.554 与 39.679 / 26.480 / 38.216 / 28.325 / 38.591 / 29.172）。原因是 DoA 只经由 `F` 进入多项式，非简并时 `eigh` 与 `eig` 的特征向量相同；只有近似简并（实测 `|λ₁|−|λ₂|` 最小 4.6e-5）时两者才在简并子空间内选不同的基，而这时 `eigh` 选的基让 `F` 仍然是**合法投影**——这正是我们想要的。
+
+**已生成的数据集与权重不受影响**：`Rz` 完全由模型权重与输入决定，改的只是"怎么分解它"，所以旧 `.pt` 与旧权重可以继续用。
+
+### 16.9 改动五：ESPRIT 也批量化（`src/models.py` 的 `esprit`）
+
+只有 `--diff_method esprit`（`SubspaceNetEsprit`）走这条路。原实现与 `root_music` 同样的毛病：`for iter in range(batch_size)` 逐样本、每样本两次 `torch.linalg.eig`。实测 batch 512 原实现 **664 ms**，批量版 **2.3 ms（288×）**。改写要点：
+
+- 两次分解都批量做：第一次 `eigh`（协方差 Hermitian），`phi`（M×M）用 `eigvals`；
+- `Us_upper` 是**方阵**，原代码本来就调 `pinv`，批量 `pinv` 值一致（最小二乘解，不是"逆"）；
+- 换 `eigh` 后**不再需要 `argsort(|λ|)`**：Hermitian 矩阵的特征值已按升序返回，`flip` 后即降序。
+
+```python
+eigenvalues, eigenvectors = torch.linalg.eigh(Rz)
+eigenvectors = torch.flip(eigenvectors, dims=[-1])
+Us = eigenvectors[:, :, :M]                        # [B, N, M]
+Us_upper, Us_lower = Us[:, :-1, :], Us[:, 1:, :]   # [B, N-1, M]
+phi = torch.linalg.pinv(Us_upper) @ Us_lower       # [B, M, M]
+phi_eigenvalues = torch.linalg.eigvals(phi)
+doa_batches = -1 * torch.arcsin((1 / np.pi) * torch.angle(phi_eigenvalues))
+```
+
+**验证**：`python verify_esprit_batch.py`（仓库根，内联保留原逐样本实现）→ exit 0。前向 max 偏差 batch 1/2/8/32/256/512/1024 = 1.9e-06 / 3.2e-06 / 2.5e-05 / 9.3e-05 / 4.9e-04 / 5.9e-04 / 2.9e-04 rad（容差 1e-3）；梯度相对差 ≤ 3.8e-04。**误差随 batch 变大是"取 batch 内最大值"的极值统计**，不是实现有问题；`arcsin` 的自变量接近 ±1 时也会放大误差——这是容差取 1e-3 而非 1e-4 的原因。
+
+**对本复现无影响**：`reproduce_array_mismatch.py` 用 `diff_method="root_music"`，不经过 `esprit`；已训练的 root_music 权重也不受影响。这处改动只帮助想用 `--diff_method esprit` 训练的人。
+
+### 16.10 完整的提速账（RTX 4060 Laptop，batch 512）
+
+| 阶段 | 最初 | 现在 | 倍数 |
 |---|---|---|---|
 | `gram_diagonal_overload` | 57.21 ms | 0.093 ms | 612× |
-| `root_music` | ≈ 1670 ms（按 batch 512 外推） | 24.1 ms | ≈ 69× |
-| 完整 forward | 96.5 ms | 28.9 ms | 3.3× |
-| **整步训练** | 1112 ms/step | **535.6 ms/step** | **2.1×** |
-| 吞吐 | 663 样本/s | **956 样本/s** | 1.4× |
-| 推算论文规模每 epoch | ≈ 64 s | **≈ 44 s** | 1.5× |
+| 8×8 特征分解（`eig`→`eigh`） | 7.40 ms | 0.24 ms | 31× |
+| `root_music`（合计） | ≈ 1670 ms（按 16 样本外推） | 20.1 ms | ≈ 83× |
+| `esprit`（仅 esprit 分支） | 664 ms | 2.31 ms | 288× |
+| 完整 forward | 96.5 ms | 21.7 ms | 4.4× |
+| **整步训练** | 1112 ms/step | **488.8 ms/step** | **2.3×** |
+| 吞吐 | 663 样本/s | **1047 样本/s** | 1.6× |
+| 推算论文规模每 epoch | ≈ 64 s | **≈ 41 s** | 1.6× |
 
-（`root_music` 的"原始"列取自 `verify_batched_ops.py` 里按 16 样本外推的值；`gram` 与整步来自本机实测。）
+**瓶颈已经换人了**：现在整步 489 ms 里 forward 只占 21.7 ms，**96% 在反向传播**。再想提速得换思路（混合精度、`torch.compile`、减少 `root_music` 反向的算子数），而不是继续找 Python 循环。反向的算子表（batch 512，本机）排前几位的是 `MinBackward1` 681 ms/1536 calls、`LinalgVectorNormBackward0` 512 ms/3072、`IndexSelectBackward0` 478 ms/3072、`aten::to` 466 ms/12324 —— 都是"每样本一次"的语义带来的 kernel 数量，不是某个单一大算子。
 
-到这一步，**剩下的大头是反向传播本身**：forward 只占 29 ms，而整步要 535 ms。所以再想提速得换思路（混合精度、或者减少 `root_music` 反向的代价），不是继续找循环了。
+### 16.11 还没做的项（按性价比排序）
+
+1. **`src/utils.py:128` `find_roots_torch`**：伴随矩阵建在 CPU 上（§16.2 的陷阱）。`root_music` 用 `find_roots_batched`、`esprit` 已批量化，所以现在基本没有生产路径走它。
+2. 两个评估用 DataLoader 加 `num_workers=4, pin_memory=True`（`reproduce_array_mismatch.py:710-711`）。注意数据是**内存里的张量列表**，不是磁盘 I/O，收益有限。
+3. `src/training.py:437` 每个 best epoch 都会 `copy.deepcopy(model.state_dict())`；改成存盘 + 结束回读可省一份拷贝峰值。模型只有 0.17 MB，收益很小。
+4. **反向传播（占整步的 96%）**：需要混合精度或重写 `root_music` 的可微路径，属重活，暂不做。
 
 

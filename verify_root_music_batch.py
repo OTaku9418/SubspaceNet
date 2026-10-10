@@ -51,8 +51,13 @@ def root_music_reference(Rz: torch.Tensor, M: int, batch_size: int):
     Bs_Rz = Rz
     for iter in range(batch_size):
         R = Bs_Rz[iter]
-        eigenvalues, eigenvectors = torch.linalg.eig(R)
-        Un = eigenvectors[:, torch.argsort(torch.abs(eigenvalues)).flip(0)][:, M:]
+        # 本脚本验证的是"批量化"本身, 所以参考实现用与 src/models.py:root_music 相同的分解
+        # 方式 (`eigh`, 见那边的注释)。换成 eig 校验的不是同一件事: 两者在计算上等价, 但
+        # eig 的 CUDA 路径对这些小批量矩阵是 CPU-bound 的, 跑起来慢一个数量级。
+        eigenvalues, eigenvectors = torch.linalg.eigh(R)
+        eigenvalues = torch.flip(eigenvalues, dims=[-1])
+        eigenvectors = torch.flip(eigenvectors, dims=[-1])
+        Un = eigenvectors[:, M:]
         F = torch.matmul(Un, torch.t(torch.conj(Un)))
         diag_sum = sum_of_diags_torch(F)
         roots = find_roots_torch(diag_sum)

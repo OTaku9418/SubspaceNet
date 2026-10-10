@@ -18,15 +18,20 @@
     python bench_train.py --device cpu          # 对照 CPU
 
 参考值 (RTX 4060 Laptop, torch 2.0.1+cu118, T=100, N=8, tau=8):
-    数据生成    1.008 ms/样本
-    batch=2     forward 3.8 ms/step    step 12.6 ms/step   吞吐 158.5 样本/s
-    batch=512   forward 29.4 ms/step   step 535.6 ms/step  吞吐 955.6 样本/s
-    batch=1024  forward 58.4 ms/step   step 1060.0 ms/step 吞吐 965.6 样本/s
-    推算论文规模 (40500 训练 + 4500 验证) 约 44 s/epoch
+    数据生成    0.920 ms/样本
+    batch=2     forward  2.3 ms/step    step    9.6 ms/step   吞吐  206.9 样本/s
+    batch=512   forward 21.7 ms/step    step  488.8 ms/step   吞吐 1047.0 样本/s
+    batch=1024  forward 41.0 ms/step    step  968.8 ms/step   吞吐 1056.5 样本/s
+    推算论文规模 (40500 训练 + 4500 验证) 约 40.7 s/epoch
+
+注意这是 **eigh + 批量 root_music + 批量 gram** 之后的数字；这些优化之前
+batch=512 是 forward 96.5 ms / step 1112 ms。所以**先确认服务器上的代码包含
+`git log --oneline -5` 里的那批性能提交**，再拿这里的数字对照。
 
 如果某项比参考值慢 5 倍以上, 基本可以断定不是"卡慢", 而是那一段落到了 CPU、
 或者被 JIT/同步拖住 —— 请把完整输出发回来。慢在 forward 里的话再跑
-`python profile_forward.py`, 它会指出具体是哪个模块。
+`python profile_forward.py` 与 `python probe_forward_detail.py`,
+它们会指出具体是哪个模块/哪个 linalg 调用。
 """
 
 import argparse
