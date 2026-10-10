@@ -34,7 +34,41 @@ import time
 
 import torch
 
-DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+def _early_device():
+    """Resolve ``--device`` before anything imports ``src.utils.device``.
+
+    ``src.utils.device`` is a module-level constant (`cuda:0` whenever CUDA is visible) and
+    ``src.models`` binds it at import time, so a script cannot switch the device afterwards.
+    Parsing the single flag from ``sys.argv`` here and patching the constant right away keeps
+    every project module on the requested device without touching repository code.
+
+    ``CUDA_VISIBLE_DEVICES=3`` is the alternative and needs no flag at all: it renumbers the
+    visible GPUs, so the hard-coded `cuda:0` lands on physical GPU 3.
+    """
+
+    import src.utils as project_utils
+
+    spec = None
+    argv = sys.argv[1:]
+    for position, token in enumerate(argv):
+        if token == "--device":
+            if position + 1 < len(argv):
+                spec = argv[position + 1]
+            break
+        if token.startswith("--device="):
+            spec = token.split("=", 1)[1]
+            break
+    if not spec or spec == "default":
+        return project_utils.device
+    chosen = project_utils.resolve_device(spec)
+    project_utils.device = chosen
+    if chosen.type == "cuda" and chosen.index:
+        torch.cuda.set_device(chosen.index)
+    return chosen
+
+
+DEVICE = _early_device()
 
 
 def timeit(fn, repeats=5, warmup=2):
@@ -309,10 +343,21 @@ def profile_ops(model, batch_size, backward=False, top=18):
         if DEVICE.type == "cuda":
             torch.cuda.synchronize()
 
-    key = "cuda_time_total" if DEVICE.type == "cuda" else "cpu_time_total"
-    events = sorted(prof.key_averages(), key=lambda e: getattr(e, key), reverse=True)[:top]
+    # torch 2.9+ 的 FunctionEventAvg 去掉了 cuda_time_total/device_time_total，只留
+    # cpu_time_total 与 self_*_time_total；逐个候选名探测，避免整节输不出来。
+    def time_of(event, device_side=True):
+        names = ("device_time_total", "cuda_time_total", "self_device_time_total",
+                 "self_cuda_time_total") if device_side else ("cpu_time_total",)
+        for name in names:
+            value = getattr(event, name, None)
+            if value is not None:
+                return value
+        return 0.0
+
+    events = sorted(prof.key_averages(), key=lambda e: time_of(e, DEVICE.type == "cuda"),
+                    reverse=True)[:top]
     for event in events:
-        cuda = getattr(event, "cuda_time_total", 0.0)
+        cuda = time_of(event, True)
         cpu = getattr(event, "cpu_time_total", 0.0)
         print(f"  {event.key[:44]:46s} cuda {cuda/1e3:10.2f} ms  cpu {cpu/1e3:9.2f} ms  "
               f"calls={event.count}")
@@ -327,6 +372,9 @@ def main():
     parser.add_argument("--no-profile", action="store_true")
     parser.add_argument("--repeats", type=int, default=10,
                         help="每项计时的重复次数（默认 10；数值会随此处变化, 看比例不看绝对值）")
+    parser.add_argument("--device", default=None,
+                        help="default|cpu|cuda|cuda:2|2。在导入 src 之前生效，等价于设 "
+                             "CUDA_VISIBLE_DEVICES，但不需要改环境。")
     args = parser.parse_args()
 
     describe()

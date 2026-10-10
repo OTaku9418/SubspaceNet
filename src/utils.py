@@ -32,6 +32,56 @@ D2R = 1 / R2D
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 
+def resolve_device(spec: str = None) -> torch.device:
+    """Pick the torch device for a script, optionally overriding the module default.
+
+    The module-level ``device`` above is a constant that is evaluated at import time and is
+    imported by every other module, so a script cannot change it after the fact without
+    patching several modules. Scripts that want to let the user pick a GPU should call this
+    instead and use the result locally.
+
+    Args:
+    -----
+        spec (str): ``None``/``"default"`` for the module default, ``"cpu"``, ``"cuda"``,
+            ``"cuda:2"``, or a bare index such as ``"2"``. A bare index is interpreted as a
+            CUDA device index.
+
+    Returns:
+    --------
+        torch.device: The requested device, or the module default when ``spec`` is falsy.
+
+    Note:
+    -----
+        ``CUDA_VISIBLE_DEVICES=2`` also works and is usually the more convenient option: it
+        renumbers the visible GPUs, so ``cuda:0`` inside the process refers to physical GPU 2.
+        All repository code defaults to ``cuda:0``, so the environment variable needs no code
+        change at all.
+    """
+
+    if not spec or spec == "default":
+        return device
+    text = str(spec).strip()
+    if text == "cpu":
+        return torch.device("cpu")
+    if text.isdigit():
+        text = f"cuda:{text}"
+    resolved = torch.device(text)
+    if resolved.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError(
+            f"请求的设备 {resolved} 不可用: torch.cuda.is_available() 为 False。"
+            " 请检查驱动与 CUDA 版本, 或改用 --device cpu。"
+        )
+    if resolved.type == "cuda":
+        index = 0 if resolved.index is None else resolved.index
+        count = torch.cuda.device_count()
+        if index >= count:
+            raise RuntimeError(
+                f"请求的设备 {resolved} 不存在: 本进程可见 {count} 张卡。"
+                " 注意 CUDA_VISIBLE_DEVICES 会重新编号可见设备。"
+            )
+    return resolved
+
+
 # Functions
 # def sum_of_diag(matrix: np.ndarray) -> list:
 def sum_of_diag(matrix: np.ndarray):

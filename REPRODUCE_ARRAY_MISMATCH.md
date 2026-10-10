@@ -1072,5 +1072,47 @@ doa_batches = -1 * torch.arcsin((1 / np.pi) * torch.angle(phi_eigenvalues))
 2. 两个评估用 DataLoader 加 `num_workers=4, pin_memory=True`（`reproduce_array_mismatch.py:710-711`）。注意数据是**内存里的张量列表**，不是磁盘 I/O，收益有限。
 3. `src/training.py:437` 每个 best epoch 都会 `copy.deepcopy(model.state_dict())`；改成存盘 + 结束回读可省一份拷贝峰值。模型只有 0.17 MB，收益很小。
 4. **反向传播（占整步的 96%）**：需要混合精度或重写 `root_music` 的可微路径，属重活，暂不做。
+5. **`find_roots_batched` 里的 `torch.linalg.eigvals`**：见 §16.13，这是服务器上最后一个大头。
+
+### 16.12 指定 CUDA 设备（多卡 / 多人共用机器）
+
+本仓库所有代码把设备写死成模块级常量（`src/utils.py:32`、`src/data_handler.py:40`、`src/criterions.py:35` 都是 `cuda:0`），**业务脚本里没有 `--device` 之类的参数**。要换卡有两种做法，推荐第一种：
+
+**做法一（推荐，零代码改动）：`CUDA_VISIBLE_DEVICES`**
+
+```bash
+# 只用物理 3 号卡。进程内 cuda:0 就是物理 GPU 3
+CUDA_VISIBLE_DEVICES=3 python -u reproduce_array_mismatch.py all --scenario spacing --n_train 45000
+
+# 两张卡各跑一半失配水平（注意 DATA_ROOT 必须不同，否则数据集/npz 互相覆盖）
+CUDA_VISIBLE_DEVICES=0 SUBSPACENET_DATA_ROOT=/data2/cyf/subn_a \
+  python -u reproduce_array_mismatch.py all --scenario spacing --grid 0.025,0.05  > log_a.txt 2>&1 &
+CUDA_VISIBLE_DEVICES=1 SUBSPACENET_DATA_ROOT=/data2/cyf/subn_b \
+  python -u reproduce_array_mismatch.py all --scenario spacing --grid 0.10,0.15   > log_b.txt 2>&1 &
+```
+
+关键点：`CUDA_VISIBLE_DEVICES` **会把可见卡重新编号**，所以代码里的 `cuda:0` 自动映射到你选的那张，不需要改任何源码。多进程训练时 `torchrun` 的 `local_rank` 同理（它是可见卡的序号，不是物理号）。
+
+**做法二：`--device`（基准/探针脚本已支持）**
+
+`bench_step_split.py`、`bench_train.py`、`probe_forward_detail.py`、`profile_forward.py` 支持 `--device default|cpu|cuda|cuda:2|2`。实现方式是在**导入 `src` 之前**从 `sys.argv` 里取出该参数并改写 `src.utils.device`（`src.models` 等模块在 import 时就把常量绑定了，import 之后再改无效）。业务脚本（`main.py`、`reproduce_array_mismatch.py`）没加，用环境变量即可。
+
+**怎么确认卡有没有被别人占：**
+
+```bash
+nvidia-smi                                                    # 当前占用与利用率
+nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv
+watch -n 5 nvidia-smi --query-gpu=utilization.gpu,memory.used --format=csv   # 跑的时候盯着
+```
+
+**★ 但不要拿"卡被占用"去解释服务器的慢。** 两条硬证据把它排除了：
+
+1. `torch.linalg.eigvals` 在**本机 CPU 上 15.9 ms / 512 矩阵，在 GPU 上也是 15.9 ms** —— 完全一样。既然 CPU 上同样慢，就不可能是 GPU 争用；这是 cuSolver 小批量非对称特征值求解的**每矩阵固定开销**（8×8 与 14×14 同价：5.7 ms vs 16.4 ms）。
+2. 服务器上耗时的算子换成 `eigh` 之后立刻从 11.99 s 掉到 2.19 ms。如果是卡被占，`eigh` 会一起变慢；而同一台机器上 `eigvals`（14×14）仍要 7.7 s，`eigvalsh` 只要 2.28 ms，**差 3400×**。
+
+GPU 争用会造成的是**几倍以内**的抖动：本机同一段代码、同一台机器先后跑出 514 ms/step 与 660 ms/step（28% 差），当时另一个任务正在共用这张 4060（`nvidia-smi` 显示 33% 利用率）。所以：
+
+- 看到的劣化在**几倍以内** ⇒ 值得查占用、用上面的环境变量换一张空闲卡。
+- 看到的劣化是**几百倍**（服务器的 `eigvals` 对比本机是 430×）⇒ 换卡没用，原因在算子本身（§16.13）。
 
 

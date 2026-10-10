@@ -32,6 +32,18 @@ batch=512 是 forward 96.5 ms / step 1112 ms。所以**先确认服务器上的�
 或者被 JIT/同步拖住 —— 请把完整输出发回来。慢在 forward 里的话再跑
 `python profile_forward.py` 与 `python probe_forward_detail.py`,
 它们会指出具体是哪个模块/哪个 linalg 调用。
+
+**本脚本只给出 forward 与"整步"两个数**。要知道这两者之间剩下的是什么，用
+`python bench_step_split.py --batch 512`：它把 step 拆成
+`forward(no_grad) / forward(带图) / backward / 完整 step`，并把 `root_music`
+里的 `torch.linalg.eigvals` 单独计时。本机的结论是**前向只占 4%，反向占 96%**；
+而服务器上正相反（eigvals 极慢，前向占 60%），所以判读方式完全不同 ——
+`bench_step_split.py` 里印了本机参考值供对照。
+
+**换卡/指定设备**：`--device default|cpu|cuda|cuda:2|2`，在导入 `src` 之前生效。
+业务脚本没有这个参数，用 `CUDA_VISIBLE_DEVICES=3 python ...`（会把可见卡重新编号，
+代码里的 `cuda:0` 即物理 3 号卡）。注意多进程并行时必须给不同的
+`SUBSPACENET_DATA_ROOT`，否则数据集与中间产物互相覆盖。
 """
 
 import argparse
@@ -41,7 +53,41 @@ import time
 
 import torch
 
-DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+def _early_device():
+    """Resolve ``--device`` before anything imports ``src.utils.device``.
+
+    ``src.utils.device`` is a module-level constant (`cuda:0` whenever CUDA is visible) and
+    ``src.models`` binds it at import time, so a script cannot switch the device afterwards.
+    Parsing the single flag from ``sys.argv`` here and patching the constant right away keeps
+    every project module on the requested device without touching repository code.
+
+    ``CUDA_VISIBLE_DEVICES=3`` is the alternative and needs no flag at all: it renumbers the
+    visible GPUs, so the hard-coded `cuda:0` lands on physical GPU 3.
+    """
+
+    import src.utils as project_utils
+
+    spec = None
+    argv = sys.argv[1:]
+    for position, token in enumerate(argv):
+        if token == "--device":
+            if position + 1 < len(argv):
+                spec = argv[position + 1]
+            break
+        if token.startswith("--device="):
+            spec = token.split("=", 1)[1]
+            break
+    if not spec or spec == "default":
+        return project_utils.device
+    chosen = project_utils.resolve_device(spec)
+    project_utils.device = chosen
+    if chosen.type == "cuda" and chosen.index:
+        torch.cuda.set_device(chosen.index)
+    return chosen
+
+
+DEVICE = _early_device()
 
 N_TRAIN_DEFAULT = 2000
 N_VALID_DEFAULT = 200
@@ -190,7 +236,9 @@ def main():
                         help="训练 batch 大小, 可给多个 (默认 512, 与 --smoke 一致)")
     parser.add_argument("--n-train", type=int, default=N_TRAIN_DEFAULT)
     parser.add_argument("--n-valid", type=int, default=N_VALID_DEFAULT)
-    parser.add_argument("--device", default=None, help="默认沿用 src/utils.py:32 的 device")
+    parser.add_argument("--device", default=None,
+                        help="default|cpu|cuda|cuda:2|2。在导入 src 之前生效，等价于设 "
+                             "CUDA_VISIBLE_DEVICES，但不需要改环境。")
     parser.add_argument("--skip-data", action="store_true", help="跳过数据生成计时")
     args = parser.parse_args()
 
