@@ -244,7 +244,7 @@ def get_k_peaks(grid_size: int, k: int, prediction: torch.Tensor):
 
 
 # def gram_diagonal_overload(Kx: torch.Tensor, eps: float) -> torch.Tensor:
-def gram_diagonal_overload(Kx: torch.Tensor, eps: float, batch_size: int):
+def gram_diagonal_overload(Kx: torch.Tensor, eps: float, batch_size: int = None):
     """Multiply a matrix Kx with its Hermitian conjecture (gram matrix),
         and adds eps to the diagonal values of the matrix,
         ensuring a Hermitian and PSD (Positive Semi-Definite) matrix.
@@ -254,7 +254,11 @@ def gram_diagonal_overload(Kx: torch.Tensor, eps: float, batch_size: int):
         Kx (torch.Tensor): Complex matrix with shape [BS, N, N],
             where BS is the batch size and N is the matrix size.
         eps (float): Constant multiplier added to each diagonal element.
-        batch_size(int): The number of batches
+        batch_size(int): The number of batches. Optional: this implementation infers it
+            from Kx.shape[0]. The argument is kept because three call sites pass it, but
+            note that DeepRootMUSIC.forward (src/models.py:255) calls this function without
+            it — the original signature made that call a TypeError, i.e. that model could
+            never run.
 
     Returns:
     --------
@@ -276,14 +280,17 @@ def gram_diagonal_overload(Kx: torch.Tensor, eps: float, batch_size: int):
     return Kx_gram + eps * eye
 
 
-def gram_diagonal_overload_reference(Kx: torch.Tensor, eps: float, batch_size: int):
+def gram_diagonal_overload_reference(Kx: torch.Tensor, eps: float, batch_size: int = None):
     """Original per-sample implementation of :func:`gram_diagonal_overload`.
 
-    Kept verbatim (apart from a leading underscore-free name) so that the batched version
-    above can be checked against it. See verify_batched_ops.py.
+    Kept verbatim so that the batched version above can be checked against it; see
+    verify_batched_ops.py. ``batch_size`` defaults to Kx.shape[0] exactly as in the batched
+    version, so both accept the same calls.
     """
     if not isinstance(Kx, torch.Tensor):
         Kx = torch.tensor(Kx)
+    if batch_size is None:
+        batch_size = Kx.shape[0]
 
     Kx_list = []
     bs_kx = Kx

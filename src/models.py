@@ -187,17 +187,21 @@ class DeepRootMUSIC(nn.Module):
 
     """
 
-    def __init__(self, tau: int, activation_value: float):
+    def __init__(self, tau: int, activation_value: float, M: int = 2):
         """Initializes the SubspaceNet model.
 
         Args:
         -----
             tau (int): Number of auto-correlation lags.
             activation_value (float): Value for the activation function.
+            M (int): Number of sources. forward() passes it to root_music(), which needs it
+                to know how many roots to keep; it used to read self.M without ever setting
+                it, so this model raised AttributeError on its first forward pass.
 
         """
         super(DeepRootMUSIC, self).__init__()
         self.tau = tau
+        self.M = M
         self.conv1 = nn.Conv2d(self.tau, 16, kernel_size=2)
         self.conv2 = nn.Conv2d(16, 32, kernel_size=2)
         self.conv3 = nn.Conv2d(32, 64, kernel_size=2)

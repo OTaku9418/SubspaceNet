@@ -314,11 +314,11 @@ SUBSPACENET_DATA_ROOT=/data/subspacenet python reproduce_array_mismatch.py all -
 
 ### 7.1 上全量之前先跑环境自检
 
-同目录下的 `preflight_check.py` 用 **~1 分钟、只读、不留垃圾**的方式验证 15 项前置条件，
+同目录下的 `preflight_check.py` 用 **~1 分钟、只读、不留垃圾**的方式验证 17 项前置条件，
 任何 `[FAIL]` 都意味着全量跑（数小时）会失败或结论无效：
 
 ```bash
-python preflight_check.py          # 15 项静态+轻量检查
+python preflight_check.py          # 17 项静态+轻量检查
 python preflight_check.py --full   # 额外做一次真实训练冒烟（约 1 分钟）
 ```
 
@@ -847,7 +847,7 @@ torch 从 2.0.1 跳到 2.7/2.8 跨了 7 个 minor，跑之前留意这几点：
 
 ---
 
-## 16. 训练速度：热点定位与已做的两处改动
+## 16. 训练速度：热点定位与三处逐样本循环的消除
 
 这一节只讲**性能**，不改任何复现口径。如果你觉得训练太慢（例如一个 epoch 要几十分钟），先读这里再动手。
 **最快的自查方式**是在服务器上跑 `python bench_train.py`，它会逐段计时并与本机参考值并列，一眼看出是哪一段慢了几倍（§16.6）。
@@ -997,6 +997,8 @@ return Kx_gram + eps * eye
 **注意这里是 `K^H K`（共轭转置在左）**，不是 `K K^H`，改写时别顺手"纠正"。实测：batch 512 时 **57.21 ms → 0.093 ms（612 倍）**，完整 forward **96.5 ms → 28.9 ms（3.3 倍）**。等价性见 §16.6 的 `verify_batched_ops.py`（batch 1/8/512 最大差 3.8e-6）。
 
 **教训（值得记）**：这个仓库的"逐样本 Python 循环"不止一处，而且分布在不同文件里。批量化的顺序应该是**从 profiler 的头号算子往下查**，而不是从自己以为的热点开始——`root_music` 看起来最可疑（又是求根又是 EVD），但 `gram_diagonal_overload` 才是第一个该动的（它只占 2 个 matmul，容易被当成"已经很便宜了"）。用 `python profile_forward.py` 一次就能看到。
+
+**顺带修掉的一个死代码 bug**：`gram_diagonal_overload` 的签名要求 `batch_size`，但 `DeepRootMUSIC.forward`（`src/models.py:255`，改写前）调用它时**没传**，且同一个 `forward` 还在读一个从未赋值的 `self.M`（`src/models.py:258`）。也就是说 **`DeepRootMUSIC` 这个模型从来没能跑过一次**——两次调用都会抛异常。已修：`batch_size` 改为可选（默认从 `Kx.shape[0]` 推断），`DeepRootMUSIC.__init__` 增加 `M: int = 2` 参数。它与本复现无关（`ModelGenerator` 构造不出这个模型），但既然在同一行上，就一并修掉并记在这里。
 
 ### 16.8 还没做的项（按性价比排序）
 
