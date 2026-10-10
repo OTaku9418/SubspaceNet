@@ -9,4 +9,4 @@ src/__pycache__
 data
 .vscode/
 .paper_extract/
-
+output.log
