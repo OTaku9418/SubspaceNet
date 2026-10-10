@@ -299,7 +299,8 @@ python reproduce_array_mismatch.py all --scenario spacing --limit 200
 `--train_at`（仅 `--train_levels single` 时生效）、`--grid`（评估网格，逗号分隔）、
 `--algorithms r-music esprit music`（默认三个都给）、`--limit`（评估样本上限，0=全部）、
 `--force_data`（强制重新生成数据集）、`--smoke`（2000 样本/3 epoch 的小规模冒烟；且未显式给 `--grid` 时只跑首尾两个失配水平）、
-`--device default|cpu|cuda|cuda:2|2`（用哪块卡跑，见 §16.13；默认 `default` = 按 `CUDA_VISIBLE_DEVICES` 重编号后的 `cuda:0`）。
+`--device default|cpu|cuda|cuda:2|2`（用哪块卡跑，见 §16.12；默认 `default` = 按 `CUDA_VISIBLE_DEVICES` 重编号后的 `cuda:0`）、
+`--eval_batch`（评估时一个 batch 前向一次、三个算法共享 `Rz`；默认 `1` = 逐样本、与旧结果逐位一致，见 §16.16；正式跑建议给 512）。
 
 出图相关参数（详见 **§14**）：子命令 `plot`（从已有 JSON 重画曲线图，不重跑实验）、
 `--json`（`plot` 用，可给多个结果 JSON）、`--metrics deg ref`、`--fig_dir`（PNG 输出目录）、
@@ -315,12 +316,12 @@ SUBSPACENET_DATA_ROOT=/data/subspacenet python reproduce_array_mismatch.py all -
 
 ### 7.1 上全量之前先跑环境自检
 
-同目录下的 `preflight_check.py` 用 **~1 分钟、只读、不留垃圾**的方式验证 21 项前置条件，
+同目录下的 `preflight_check.py` 用 **~1 分钟、只读、不留垃圾**的方式验证 23 项前置条件，
 任何 `[FAIL]` 都意味着全量跑（数小时）会失败或结论无效：
 
 ```bash
-python preflight_check.py          # 20 项静态+轻量检查（跳过真实训练冒烟）
-python preflight_check.py --full   # 21 项，额外做一次真实训练冒烟（约 1 分钟）
+python preflight_check.py          # 22 项静态+轻量检查（跳过真实训练冒烟）
+python preflight_check.py --full   # 23 项，额外做一次真实训练冒烟（约 1 分钟）
 ```
 
 覆盖内容：Python/依赖版本、**CUDA 可用性**（`src/utils.py:32` 的 `device` 在 import 时定型，
@@ -519,8 +520,9 @@ REFERENCES                            ← 直接结束，无附录
 **环境自检（1–2 分钟，建议正式跑之前先过一遍）**
 
 - [ ] 用极小数据跑通一次并得到四行结果：`--n_train 40 --n_test 20 --epochs 1 --batch_size 8 --limit 20`（§13.5 有预期形状）
-- [ ] `python preflight_check.py` 全绿（20 项：依赖/CUDA 真算一次/参数量 41761/RMSPE 口径 π/180/nominal 导向矢量/MUSIC 出数/数据管线/失配注入/DoA 可比性/四处批量实现的等价性/判据函数的设备跟随）
-- [ ] 需要连训练路径一起验时加 `--full`（21 项，约 1 分钟）
+- [ ] 评估侧给了 `--eval_batch 512`（否则 SubspaceNet 前向会按算法重算 3 遍；经典 MUSIC 的 18000 点网格不受它影响，见 §16.16）
+- [ ] `python preflight_check.py` 全绿（22 项：依赖/CUDA 真算一次/参数量 41761/RMSPE 口径 π/180/nominal 导向矢量/MUSIC 出数/数据管线/失配注入/DoA 可比性/六处批量实现的等价性/判据函数的设备跟随/评估分批一致性）
+- [ ] 需要连训练路径一起验时加 `--full`（23 项，约 1 分钟）
 
 **出图（PNG，见 §14）**
 
@@ -657,7 +659,7 @@ return predictions, response_curve     # src/methods.py:657-658
 - `--capture` 存 `params` 时若直接 `np.savez(dict)`，读回会撞 `ValueError: Object arrays cannot be loaded when allow_pickle=False`。**注意 `np.load` 是惰性的**——错误要到你真正取那个数组时才抛，所以 `try/except` 包住 `np.load` 本身没用，必须把数组全部取出来。现在存的是 JSON 字符串，并且 `_load_capture` 会为旧 npz 回退到 `allow_pickle=True`。
 - `RootMUSIC.narrowband` 返回的 `roots`（`src/methods.py:475-486`）是**全部 N 个根**（按到单位圆的距离排序），而 `doa_predictions` 只取单位圆内的前 M 个（`roots_inside = [root for root in roots if ((abs(root)-1) < 0)][:M]`）。画根图若按 `roots[:len(predictions)]` 取，会拿到半径 >1 的根。
 
-> 自检小抄：`python preflight_check.py` 全绿（20 项，见 §7.1），或 `python reproduce_array_mismatch.py all --scenario spacing --n_train 40 --n_test 20 --epochs 1 --batch_size 8 --limit 20` 能在 1–2 分钟内跑出上面这种形状的四行输出，说明**环境、依赖、CUDA、数据管线、三算法、指标口径**全部就绪，可以放心上全量了。
+> 自检小抄：`python preflight_check.py` 全绿（22 项，见 §7.1），或 `python reproduce_array_mismatch.py all --scenario spacing --n_train 40 --n_test 20 --epochs 1 --batch_size 8 --limit 20` 能在 1–2 分钟内跑出上面这种形状的四行输出，说明**环境、依赖、CUDA、数据管线、三算法、指标口径**全部就绪，可以放心上全量了。
 
 ---
 
@@ -838,7 +840,7 @@ python preflight_check.py --full
 
 这么改的用意：把这类错误**从"跑到第 3 项才炸、且报错位置随机"提前到第 1 组、并且直接给出结论**。第 1 组还会先做复数 `matmul` 与 `linalg.eig`——这正是 SubspaceNet 推理最依赖、也最容易撞 sm 问题的两个算子。
 
-（自检本身也在长：最近几轮陆续加了四处批量实现的等价性回归、以及判据函数的设备跟随检查，现在 `--full` 是 **21 项 / 0 FAIL**，见 §7.1。）
+（自检本身也在长：最近几轮陆续加了四处批量实现的等价性回归、以及判据函数的设备跟随检查，现在 `--full` 是 **23 项 / 0 FAIL**，见 §7.1。）
 
 ### 15.5 换 torch 版本的兼容性提醒（本项目特有）
 
@@ -1211,7 +1213,9 @@ return torch.min(rmspe_val, dim=1).values.sum()
 
 batch=2 同时从 13.7 ms/step 降到 10.0 ms/step（小 batch 下反向本来就没多少活，收益自然小）。
 
-**服务器上预期**：那条 5411 ms 的 `backward` 主体就是这个循环，按本机比例应落到 60 ms 量级，整步从 5849 ms 降到 **400 ms 上下**（≈13×），每 epoch 从 2420 s 量级降到 **≈180 s**。请用 `python bench_step_split.py --batch 2 512 --device 1` 复验。
+**服务器上实测（`bench_step_split.py --batch 2 512 --device 1`，RTX PRO 6000 Blackwell / torch 2.10.0+cu128）**：`forward (no_grad)` 365.08 ms、`forward (带计算图)` 422.49 ms、`backward only` 5410.67 ms、`完整 step` 5848.86 ms（11423.556 µs/样本）、吞吐 87.5 样本/s。即 **前向只占整步 6.2%，反向 + Adam 占 93.8%** —— 与"逐样本循环的主体在反向"完全吻合。
+
+**同一批数据里 `root_music` 的内部拆分（batch=512）**：`sum_of_diags_batched` 0.146 ms、构造伴随矩阵 0.033 ms、**`linalg.eigvals(8x8) complex64 = 283.088 ms`（552.45 µs/矩阵）**、`linalg.eigh(8x8)` 对照仅 0.127 ms。所以前向的每样本固定成本几乎全部是 `eigvals`（283 ms / 365 ms = 78%），它是前向里最后一个大头，见 §16.14。
 
 **改完之后瓶颈又换人了**（本机 batch 512，设备侧时间）：`aten::linalg_eig` 与 `aten::linalg_eigvals` 合计占 37%，`Optimizer.step#Adam.step` 占 2%，其余是 `SliceBackward0` / `DiagonalBackward0` / `copy_` / `zeros` 这类分散的小算子。**现在反向已经比前向便宜了（7.4 ms vs 28.7 ms），前向重新成为大头**，而前向里能动的就是最后那一项 `eigvals` —— 见 §16.14。
 
@@ -1316,3 +1320,74 @@ def trainable_device(module, reference: torch.Tensor) -> torch.device:
 本机没有第二张卡，所以用"把模块常量指到 `cpu`"复现同一类错配；同时也用 `bench_step_split.py --batch 8 --device cpu` 跑通了非默认设备的完整路径（含 `forward`/`backward`/Adam，参数量 41761 校验通过）。
 
 > **换卡跑之前先 `git pull`**，否则 `--device N` 会在算 loss 时崩。
+
+
+### 16.16 评估阶段为什么慢：大头是经典 MUSIC 的网格扫描，不是 SubspaceNet
+
+这个结论来自一次实测分解（本机 RTX 4060 Laptop / torch 2.0.1+cu118，200 个测试样本；下表是**网格向量化之前**的状态，向量化见 §16.17）：
+
+| 项目 | 每样本耗时 | 说明 |
+|---|---|---|
+| `r-music`（经典） | 0.286 ms | 求根，本来就快 |
+| `esprit`（经典） | 0.140 ms | 求根，本来就快 |
+| **`music`（经典）** | **157.707 ms** | **占经典三算法的 99%（已在 §16.17 向量化到 10.6 ms）** |
+| SubspaceNet 前向 batch=1 | 3.572 ms | 旧评估路径 |
+| SubspaceNet 前向 batch=32 | 0.179 ms | 批量化后 |
+| SubspaceNet 前向 batch=200 | 0.059 ms | |
+
+两条结论：
+
+1. **感觉到的"test 慢"主要来自经典 MUSIC**。它每次预测都在 18000 点网格上逐角度重算一遍二次型（`src/methods.py` 的 `spectrum_calculation`），而 Root-MUSIC / ESPRIT 只要 0.14～0.29 ms。三个经典算法合计 **173 ms/样本**，SubspaceNet 三个算法合计只有 **11.1 ms/样本**。按论文规模（5000 次 Monte Carlo × 4 个失配水平）算，经典 MUSIC 一项就要吃掉约 58 分钟，SubspaceNet 全部只要约 4 分钟。
+2. SubspaceNet 侧原来还有 **3× 冗余前向**：`eval_on_test` 的外层是 `for algo in algorithms:`，三个算法各把整份测试集前向重算一遍，而 `Rz` 与用哪个算法无关。
+
+**已落地的改法**：新增 `--eval_batch`（默认 `1`），把评估改成"**一个 batch 只前向一次，Rz 共享给三个算法**"：
+
+```bash
+python reproduce_array_mismatch.py eval --eval_batch 512 --device 0     # 正式跑用它
+```
+
+- `--eval_batch 1` 时走的仍是逐样本路径，**与改动前的数字逐位一致**（实测 25.610 / 25.513 / 25.619 / 3.933 / 5.693 / 8.859）。
+- `--eval_batch 4` 与 `--eval_batch 12` 给出**完全相同**的结果 ⇒ 分批不改变数值。
+- 批量化后 SubspaceNet 侧从 11.133 ms/样本降到 **0.464 ms/样本（24×）**。
+
+**改这个函数时踩到的两个坑（都会让结果静默变差，不会报错）**：
+
+1. **DoA 是逐样本随机的**，不是"一批共享一个真值"。`signal_creation.set_doa` 对每个样本重抽一次 DoA，所以批次里第 0 个样本的 DoA **不能**当整批的真值。写错时 `SubNet+r-music` 从 25.6083 变成 **28.7764**（差 3.17 度）—— 看起来"结果差点但不离谱"，很容易蒙混过去。批内共享的只有"同一失配水平"这件事。
+2. **`evecs[:, :, idx]` 在 3-D 下是错的**。`idx` 形状是 `(B, N)`，这种高级索引会按**前导轴**广播、把 batch 打乱，随后 `Un @ np.conj(Un).T` 抛 `matmul` 的核心维不匹配。必须用 `np.take_along_axis(evecs, order[:, None, :], axis=2)`。
+
+另外，SubNet 分支里的 MUSIC 用 `np.linalg.eig`（**不是** `eigh`）是为了与 `src/methods.py` 的 `subspace_separation` 逐位对齐：在简并子空间里 `eigh` 会旋转特征向量，实测某样本 `|λ1| - |λ2|` 小到 4.6e-5。
+
+**回归覆盖**：`preflight_check.py` 新增两项 —— `steering_vec_batch 与逐角度 steering_vec 一致`、`评估路径分批与逐样本给出同一组数字（--eval_batch 不改变结果）`。后者不训练模型，直接比较 `batch=1` 与 `batch=6` 的 RMSPE，容差取 `1e-4 × RMSPE`（未训练模型的特征值可能近乎简并，逐点预测可以差到 1e-4 度，但 RMSPE 这种**系统性**错误一定看得出来）。写这个检查时连续踩了三次形状错，最后固定为："`root_music` 返回三元组、`esprit` 直接返回张量" —— 混用 `[0]` 会串位。
+
+### 16.17 改动八：MUSIC 谱与 MVDR 响应的 18000 点网格也向量化了
+
+§16.16 指出经典 MUSIC 的网格扫描是评估阶段的大头，这一节把它做掉。
+
+**改法**：`SystemModel` 新增 `steering_vec_batch(theta, f=1, array_form="ULA", nominal=False)`（`src/system_model.py`，只在 `nominal=True` 下工作，见下），随后
+
+- `MUSIC.spectrum_calculation`（`src/methods.py`）：`core_equation = np.real(np.einsum("gn,nm,gm->g", conj(A), Un_UnH, A))`，一次取二次型的**对角元**；
+- `MVDR.narrowband`：`response_curve = 1.0 / np.real(np.einsum("gn,gn->g", conj(A), A @ inv_covariance))`。
+
+**实测（`verify_music_batch.py`，18000 点网格）**：
+
+| 项目 | 逐角度循环 | 批量 | 倍数 |
+|---|---|---|---|
+| MUSIC 谱 | 173.97 ms/样本 | **10.647 ms/样本** | 16.3× |
+| MVDR 响应曲线 | 226.51 ms/样本 | **6.828 ms/样本** | 33.2× |
+| 参照：Root-MUSIC | — | 0.276 ms/样本 | — |
+
+等价性（同一个 `Un`、同一张网格）：`core_equation` 最大差 `8.006e-15`（相对 `1.001e-15`）、谱峰值位置一致（6707）、端到端预测角度差 `0.000e+00` rad；MVDR 响应最大差 `4.444e-15`（相对 `7.160e-16`）、峰值位置一致（6704）。⇒ **是纯提速，不是近似**。
+
+**MVDR 这一项踩了两个坑，都值得记**：
+
+1. **共轭方向**。原循环里 `a` 是**列向量**且 `a[m] = exp(+j·2π·d·m·sinθ)`，而 `steering_vec_batch` 返回的行是 `exp(-j·2π·d·m·sinθ) = conj(a[m])`。因 `invC` Hermitian 有 `a^T @ invC = (invC @ conj(a))^T`，行向量必须取 `np.conj(A)`；直接用 `A` 算的是"共轭导向矢量"的响应，各角度相对缩放不同，相对偏差 **3.581e-01**。
+2. **必须用化简式，不能照抄 `num/d²`**。按推导 `response_g = a^H invC C_loaded invC a / d_g²`（`d_g = a_g^H invC a_g`），但先形成 `invC @ dl @ invC` 会经过一个 `cond ~ 1.3e3` 的中间量：矩阵层面残差只有 `1.39e-17`，作用到 `a` 上却放大到 **1.7e-4**，被 `d² ≈ 0.0603` 一除到 `4e-3`，再被 `argmax` 放大成错误峰值。改用恒等式 `invC C_loaded invC = invC`（`C_loaded` 可逆且 `invC` 是它的逆）后 `response_g = 1/d_g`，与循环版相差 `7.2e-16`。**定位方法**：把"向量化式"与"循环式"的中间量逐项并列打印，发现 `num/d²` 与循环版**完全相等**、而 `||v − c·a|| = 0.00599`（`v` 与 `a` 不平行）—— 两条一起把"共轭方向"和"必须除 `d²`"钉死，才敢去查条件数。
+
+**为什么 `steering_vec_batch` 拒绝 `nominal=False`**：带失配的流形每个样本都不同，本身不构成"网格"，没有批量意义；更重要的是 `nominal=False` 会**抽取失配参数**，那会扰动全局随机流、破坏数据生成的可复现性。所以直接抛 `ValueError`（回归见 §16.16 提到的 preflight 新增项）。
+
+### 16.18 评估阶段还没做的项
+
+1. 两个评估用 DataLoader 加 `num_workers` / `pin_memory`：数据是**内存里的张量列表**，不是磁盘 I/O，收益有限。
+2. 若要再省，可让评估**只跑需要的算法**（`--algorithms`），经典 MUSIC 现在已不是大头。
+
+

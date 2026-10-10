@@ -192,6 +192,53 @@ class SystemModel(object):
                 f"SystemModel.steering_vec: array form {array_form} is not defined"
             )
 
+    def steering_vec_batch(
+        self, theta: np.ndarray, f: float = 1, array_form="ULA", nominal=False
+    ):
+        """Steering vectors for *many* angles in one shot (nominal form).
+
+        数学上等价于对每个角度各调用一次 `steering_vec(..., nominal=True)` 再把结果
+        摞起来, 但只用一次广播 —— 18000 点的 MUSIC 网格因此从毫秒级 Python 循环
+        变成一次矩阵运算。
+
+        与 `steering_vec` 的两点区别(都是有意为之):
+          1. 只实现标称(nominal)形式。`spectrum_calculation`/MVDR 求响应曲线用的都是
+             标称流形 (`nominal=True`); 带失配的流形本身不构成"网格", 没有批量意义。
+          2. **不消耗随机数**: `nominal=False` 时会抽取失配参数, 而批量的失配矩阵不是
+             单个流形, 故这里直接拒绝。这样多次调用不会改变全局随机状态(重要: 数据生成
+             的可复现性依赖随机流)。
+
+        Args:
+        -----
+            theta (np.ndarray): 角度数组, shape (G,) (也可以传 (G, 1)).
+            f (float, optional): 频率. Defaults to 1.
+            array_form (str, optional): 阵列形式. Defaults to "ULA".
+            nominal (bool): 必须为 True.
+
+        Returns:
+        --------
+            np.ndarray: shape (G, N) 的复数矩阵, 第 g 行是角度 theta[g] 的导向矢量.
+        """
+        if not nominal:
+            raise ValueError(
+                "steering_vec_batch 只支持 nominal=True (见 docstring 第 2 条)."
+            )
+        if not array_form.startswith("ULA"):
+            raise Exception(
+                f"SystemModel.steering_vec_batch: array form {array_form} is not defined"
+            )
+        f_sv = {"NarrowBand": 1, "Broadband": f}
+        theta = np.asarray(theta, dtype=float).reshape(-1)
+        phase = (
+            -2
+            * np.pi
+            * f_sv[self.params.signal_type]
+            * self.dist[self.params.signal_type]
+            * self.array[None, :]
+            * np.sin(theta)[:, None]
+        )
+        return np.exp(1j * phase)
+
     def __str__(self):
         """Returns a string representation of the SystemModel object.
         ...

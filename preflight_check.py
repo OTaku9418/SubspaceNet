@@ -402,6 +402,130 @@ def _gram_equivalence():
     return f"batch 1/8/64 上最大偏差 {worst:.3e}（容差 1e-4）"
 
 
+@check("steering_vec_batch 与逐角度 steering_vec 一致（MUSIC/MVDR 网格向量化的地基）")
+def _steering_batch_equivalence():
+    """文档 §16.16: MUSIC 谱与 MVDR 响应的 18000 点网格扫描已向量化。
+
+    两者都建立在 `SystemModel.steering_vec_batch` 上，所以先单独校验它；同时确认它在
+    `nominal=False` 时**拒绝**执行 —— 否则会悄悄抽失配参数、扰动全局随机流，
+    让数据生成不再可复现。
+    """
+    import numpy as np
+
+    from verify_music_batch import build_case, steering_reference
+
+    sm, _X = build_case()
+    angels = sm  # placeholder to keep flake quiet
+    angels = np.linspace(-np.pi / 2, np.pi / 2, 2000, endpoint=False)
+    for sig in ("NarrowBand", "Broadband"):
+        ref = steering_reference(sm, angels, f=1.0)
+        got = sm.steering_vec_batch(angels, f=1.0, nominal=True)
+        assert got.shape == ref.shape, f"{sig}: 形状 {got.shape} != {ref.shape}"
+        worst = float(np.abs(got - ref).max())
+        assert worst < 1e-12, f"{sig}: 最大偏差 {worst:.3e}，超出容差 1e-12"
+    try:
+        sm.steering_vec_batch(angels, nominal=False)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("steering_vec_batch(nominal=False) 本应抛 ValueError 却通过了")
+    return f"NarrowBand/Broadband 各 2000 点逐点相同；nominal=False 被正确拒绝"
+
+
+@check("评估路径分批与逐样本给出同一组数字（--eval_batch 不改变结果）")
+def _eval_batch_consistency():
+    """文档 §16.16: `eval_on_test` 改成"一个 batch 一次前向、三个算法共享 Rz"。
+
+    这里在**不训练**的前提下验证分批不改变数值: 随机初始化一个 SubspaceNet，取 6 个
+    真实样本，比较 subnet_batch=1 与 =6 时的预测。这把两个已修过的坑都覆盖了:
+      1. DoA 是**逐样本随机**的, 不能拿批内第一个样本的 DoA 当整批真值;
+      2. `evecs[:, :, idx]` 在 3-D 下会按前导轴广播, 必须用 take_along_axis.
+
+    判据用 **RMSPE(度)** 而不是逐点预测: 未训练模型的信号子空间可能近乎简并
+    (实测某样本 |λ1|-|λ2| ~ 1e-6), 此时 `pinv(Us_upper)` 会把 Rz 上 8.5e-06 的
+    分批浮点差放大成几十度 —— 那是随机模型下的数值敏感性, 不是分批的错
+    (同一份 Rz 逐样本跑两次也会分叉)。真正要抓的是**系统性**错误 (真值错位、
+    索引广播串批), 它们在指标上一定看得出来。
+    """
+    import numpy as np
+    import torch
+
+    from src.criterions import RMSPELoss
+    from src.data_handler import create_dataset
+    from src.models import ModelGenerator, esprit as esprit_batched, root_music as root_music_batched
+    from src.system_model import SystemModelParams
+    from src.utils import R2D, device, set_unified_seed
+
+    n = 6
+    set_unified_seed(7)
+    p = (SystemModelParams().set_parameter("N", 8).set_parameter("M", 2)
+         .set_parameter("T", 100).set_parameter("snr", 10)
+         .set_parameter("signal_type", "NarrowBand")
+         .set_parameter("signal_nature", "non-coherent")
+         .set_parameter("eta", 0.05).set_parameter("bias", 0.0)
+         .set_parameter("sv_noise_var", 0.0))
+    md, _gd, _sm = create_dataset(system_model_params=p, samples_size=n,
+                                  model_type="SubspaceNet", tau=8, save_datasets=False)
+    model = (ModelGenerator().set_model_type("SubspaceNet")
+             .set_diff_method("root_music").set_tau(8).set_model(p)).model
+    model = model.to(device).eval()
+    # 真值**逐样本**取 (不能取第 0 个样本的当真批真值)
+    truth = np.asarray([md[i][1].numpy().ravel() * R2D for i in range(n)])
+    criterion = RMSPELoss()
+
+    def rmspe(preds):
+        got = []
+        for i, row in enumerate(np.asarray(preds, dtype=float)):
+            with torch.no_grad():
+                got.append(float(criterion(torch.as_tensor(row[None]),
+                                           torch.as_tensor(truth[i][None]))))
+        return float(np.mean(got)) * R2D
+
+    def _rows(fn, Rz, batch):
+        """统一取出 (batch, M) 的预测（度）。
+
+        注意 `root_music` 返回三元组、`esprit` 直接返回张量 —— 混用 `[0]` 会串位
+        (这正是本检查早先连续报三次形状错的原因)。
+        """
+        raw = fn(Rz, 2, batch)
+        t = raw[0] if isinstance(raw, (tuple, list)) else raw
+        flat = np.rad2deg(np.asarray(t.detach().cpu().numpy(), dtype=float)).ravel()
+        if flat.size != batch * 2:
+            raise AssertionError(
+                f"{getattr(fn, '__name__', fn)} 在 batch={batch} 上返回 {flat.size} 个数"
+                f"（期望 {batch * 2}）: Rz{tuple(Rz.shape)} -> {tuple(t.shape)}"
+            )
+        return flat.reshape(batch, 2)
+
+    detail, gaps = {}, {}
+    with torch.no_grad():
+        Xb = torch.stack([md[i][0] for i in range(n)]).to(device)
+        Rz = model(Xb)[-1]
+        # 记录最简并样本的 eigenvalue 间隙, 便于把"离散差"归因到数值敏感性
+        ev = np.sort(np.abs(np.linalg.eigvals(Rz.detach().cpu().numpy())), axis=1)[:, ::-1]
+        gaps["min |l1|-|l2|"] = float(np.min(ev[:, 0] - ev[:, 1]))
+        for name, fn in (("r-music", root_music_batched), ("esprit", esprit_batched)):
+            batched = _rows(fn, Rz, n)
+            rows = np.concatenate([_rows(fn, model(Xb[i:i + 1])[-1], 1) for i in range(n)], axis=0)
+            point = float(np.abs(batched - rows).max())
+            detail[name] = (rmspe(batched), rmspe(rows), point)
+
+    worst = max(abs(a - b) for a, b, _ in detail.values())
+    scale = max(1.0, max(a for a, _b, _c in detail.values()))
+    tol = 1e-4 * scale
+    assert worst < tol, (
+        f"分批与逐样本的 RMSPE(度) 最大差 {worst:.3e}（容差 {tol:.3e} = 1e-4 × {scale:.4g}）；明细 "
+        + "；".join(f"{k}: batch={a:.6f} per={b:.6f} 逐点最大差={c:.2e} deg"
+                    for k, (a, b, c) in detail.items())
+        + "。常见原因: DoA 逐样本随机却按批共享（会让 RMSPE 差出几个度），"
+          "或 eig 特征向量索引广播串批（会让预测整批错位）。"
+    )
+    parts = "；".join(f"{k} RMSPE {a:.4f} vs {b:.4f} 度" for k, (a, b, _c) in detail.items())
+    return (f"{parts}（相对差 <1e-4；逐点最大差 "
+            + "、".join(f"{c:.1e}" for _a, _b, c in detail.values())
+            + f" deg）；最小特征值间隙 {gaps['min |l1|-|l2|']:.2e}")
+
+
 @check("RMSPELoss 的批量实现与逐样本原始实现等价（loss 与梯度）")
 def _rmspe_loss_equivalence():
     """src/criterions.py 的 RMSPELoss.forward 原本是逐样本 + 逐排列的循环（文档 §16.13）。

@@ -50,6 +50,7 @@ import matplotlib
 matplotlib.use("Agg")           # 服务器无显示器, 必须在 pyplot 之前设定
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np
+import scipy.signal
 import torch
 
 warnings.simplefilter("ignore")
@@ -112,7 +113,7 @@ DEVICE = _early_device()
 
 from src.data_handler import create_dataset, read_data  # noqa: E402
 from src.methods import Esprit, MUSIC, RootMUSIC  # noqa: E402
-from src.models import ModelGenerator  # noqa: E402
+from src.models import ModelGenerator, esprit as esprit_batched, root_music as root_music_batched  # noqa: E402
 from src.plotting import initialize_figures  # noqa: E402
 from src.system_model import SystemModel, SystemModelParams  # noqa: E402
 from src.training import TrainingParams, train_model  # noqa: E402
@@ -349,6 +350,23 @@ class _PltShim:
 
 def _eigs(covariance: np.ndarray) -> np.ndarray:
     return np.sort(np.linalg.eigvalsh(np.asarray(covariance, dtype=complex)))[::-1]
+
+
+def _music_preds_from_spectrum(spectrum: np.ndarray, angels: np.ndarray, M: int) -> np.ndarray:
+    """把一条 MUSIC 谱还原成预测角度, 逐字复刻 `MUSIC.narrowband` 的后处理.
+
+    必要性: 批量化之后不能再用 `MUSIC(...).narrowband(...)` 拿预测, 但必须保持
+    单样本数值完全一致. 原路径 (`src/methods.py:405-409`) 是:
+        peaks = list(scipy.signal.find_peaks(spectrum)[0])
+        peaks.sort(key=lambda x: spectrum[x], reverse=True)
+        predictions = self._angels[peaks] * R2D
+        predictions = predictions[:M][::-1]
+    这里逐行照搬, 保证 `--subnet_batch 1` 与旧行为逐位相同.
+    """
+    peaks = list(scipy.signal.find_peaks(spectrum)[0])
+    peaks.sort(key=lambda x: spectrum[x], reverse=True)
+    predictions = angels[peaks] * R2D
+    return predictions[:M][::-1]
 
 
 def _capture_path(capture_dir: Path, scenario: str, tag: str) -> Path:
@@ -744,7 +762,8 @@ def train_one(scenario: str, value: float, train_ds, epochs: int, batch_size: in
 # ------------------------------------------------------------------------------
 def eval_on_test(scenario: str, value: float, model_test_ds, generic_test_ds,
                  samples_model, ckpt: Path, algorithms: list[str], limit: int = 0,
-                 capture_dir: Path | None = None, capture_index: int = 0):
+                 capture_dir: Path | None = None, capture_index: int = 0,
+                 subnet_batch: int = 1):
     cfg = SCENARIOS[scenario]
     params = make_params(**{cfg["sweep_param"]: value})
     # 评估时必须用测试集自己的系统模型 (决定导向矢量/频率)
@@ -758,10 +777,17 @@ def eval_on_test(scenario: str, value: float, model_test_ds, generic_test_ds,
     model = model.to(device)
     model.eval()
 
-    # 为了让 evaluate_* 内部把样本解释成 (1,N,T), 按 main.py 的方式包一层
-    model_dl = torch.utils.data.DataLoader(model_test_ds, batch_size=1, shuffle=False)
+    # 为了让 evaluate_* 内部把样本解释成 (1,N,T), 按 main.py 的方式包一层.
+    # SubNet 分支现在按 `subnet_batch` 直接索引 model_test_ds (一个 batch 只前向一次),
+    # 所以只有传统算法还需要这个 batch=1 的 DataLoader;
+    # 传统算法本身是逐样本 numpy, 批不起来.
     generic_dl = torch.utils.data.DataLoader(generic_test_ds, batch_size=1, shuffle=False)
     n_eval = limit if limit > 0 else len(model_test_ds)
+
+    # 经典算法对象是只读的 (narrowband 不改自身状态), 建一次复用, 省掉每样本的构造开销
+    music_classic = MUSIC(samples_model)
+    rmus_classic = RootMUSIC(samples_model)
+    esprit_classic = Esprit(samples_model)
 
     capture_sample = capture_index if capture_index >= 0 else n_eval - 1
     cap_store: dict = {}
@@ -805,58 +831,122 @@ def eval_on_test(scenario: str, value: float, model_test_ds, generic_test_ds,
         print(f"[cap  ] 已存谱/根/协方差数据 -> {cap_path.name}")
 
     results = {}
-    for algo in algorithms:
-        # --- SubspaceNet 增强 ---
-        agg = {"ref": 0.0, "deg": 0.0, "fixed": 0.0}
-        n_fail, n_used = 0, 0
-        with torch.no_grad():
-            for i, (X, DOA) in enumerate(model_dl):
-                if i >= n_eval:
-                    break
-                X = X.to(device)
-                if algo == "esprit":
-                    preds, M = Esprit(samples_model).narrowband(
-                        X=X, mode="SubspaceNet", model=model
-                    )
-                elif algo == "music":
-                    preds, _spectrum, M = MUSIC(samples_model).narrowband(
-                        X=X, mode="SubspaceNet", model=model
-                    )
-                else:
-                    preds, _roots, _all, _rang, M = RootMUSIC(samples_model).narrowband(
-                        X=X, mode="SubspaceNet", model=model
-                    )
-                preds = as_pred_array(preds)
-                if preds.size < M:
-                    n_fail += 1
-                gt = DOA.detach().cpu().numpy().ravel() * R2D
-                agg["ref"] += rmspe_reference(preds, gt)
-                agg["deg"] += rmspe_degrees(preds, gt)
-                agg["fixed"] += rmspe_degrees_fixed(preds, gt)
-                n_used += 1
-                if (capture_dir is not None and algo not in cap_store
-                        and i == capture_sample and i < len(generic_test_ds)):
+
+    # --- SubspaceNet 增强: 所有算法在同一个 batch 上共享一次前向 ---
+    # 旧写法的结构是 `for algo in algorithms:` 包住整个测试集循环, 于是每个算法都把整份
+    # 测试集前向重算一遍, 而 Rz 与用哪个算法无关 (3 个算法 => 3x 冗余前向).
+    # 现在改为外层走 batch, 一次前向喂给全部算法. subnet_batch=1 时算法调用与旧写法逐字相同,
+    # 数值逐位一致; subnet_batch>1 时走 src.models 的批量化 root_music/esprit.
+    sub_agg = {a: {"ref": 0.0, "deg": 0.0, "fixed": 0.0} for a in algorithms}
+    sub_fail = {a: 0 for a in algorithms}
+    n_scored = 0
+    n_done = 0
+
+    def _score(algo: str, preds, M: int, gt) -> None:
+        """累计一个样本 (或一对 (样本, 算法)) 的三套 RMSPE 与失败计数."""
+        preds = as_pred_array(preds)
+        if preds.size < M:
+            sub_fail[algo] += 1
+        agg = sub_agg[algo]
+        agg["ref"] += rmspe_reference(preds, gt)
+        agg["deg"] += rmspe_degrees(preds, gt)
+        agg["fixed"] += rmspe_degrees_fixed(preds, gt)
+
+    with torch.no_grad():
+        while n_done < n_eval:
+            want = min(subnet_batch, n_eval - n_done)
+            Xs, DOAs = [], []
+            for i in range(n_done, n_done + want):
+                xi, di = model_test_ds[i]
+                Xs.append(xi)
+                DOAs.append(di)
+            Xb = torch.stack(Xs).to(device)
+            # 注意: DoA 是**逐样本随机**的 (signal_creation.set_doa 每个样本重抽),
+            # 不能拿批内第一个样本的 DoA 当整批的真值 —— 那样会把 RMSPE 抬高几个度
+            # (实测把逐样本的 25.61 变成 28.78). 批内共享的只有"同一失配水平"这件事.
+            gt_b = [d.detach().cpu().numpy().ravel() * R2D for d in DOAs]
+            if subnet_batch == 1:
+                X = Xb
+                for algo in algorithms:
+                    if algo == "esprit":
+                        preds, M = esprit_classic.narrowband(
+                            X=X, mode="SubspaceNet", model=model
+                        )
+                    elif algo == "music":
+                        preds, _spectrum, M = music_classic.narrowband(
+                            X=X, mode="SubspaceNet", model=model
+                        )
+                    else:
+                        preds, _roots, _all, _rang, M = rmus_classic.narrowband(
+                            X=X, mode="SubspaceNet", model=model
+                        )
+                    _score(algo, preds, M, gt_b[0])
+            else:
+                Rz = model(Xb)[-1]           # 一次前向, 供下面全部算法复用
+                if "esprit" in algorithms:
+                    doa = esprit_batched(Rz, M_SOURCES, Rz.shape[0])
+                    rows = np.rad2deg(doa.detach().cpu().numpy())
+                    for b in range(rows.shape[0]):
+                        _score("esprit", rows[b], M_SOURCES, gt_b[b])
+                if "r-music" in algorithms:
+                    doa, _all, _roots = root_music_batched(Rz, M_SOURCES, Rz.shape[0])
+                    rows = np.rad2deg(doa.detach().cpu().numpy())
+                    for b in range(rows.shape[0]):
+                        _score("r-music", rows[b], M_SOURCES, gt_b[b])
+                if "music" in algorithms:
+                    # `eig` (不是 eigh) 是为了与 `subspace_separation` 逐位对齐:
+                    # src/methods.py:200-203 用 np.linalg.eig, 且相同 eigenvalue 差
+                    # (eigh 会在简并子空间内旋转特征向量, 实测 |λ1|-|λ2| 可小到 4.6e-5).
+                    # 注意: `evecs[:, :, idx]` 在 3-D 下是错的 —— (B,N) 的整数索引数组会
+                    # 按**前导轴**广播, 于是把 batch 打乱. 必须用 take_along_axis 沿最后一维取.
+                    evals, evecs = np.linalg.eig(Rz.detach().cpu().numpy())
+                    order = np.argsort(evals, axis=1)[:, ::-1]
+                    evecs = np.take_along_axis(evecs, order[:, None, :], axis=2)
+                    if evecs.shape[1] != Rz.shape[-1]:
+                        raise RuntimeError(
+                            f"eig 返回的特征向量形状异常: {evecs.shape} (期望 (B,{Rz.shape[-1]},N))"
+                        )
+                    m_obj = MUSIC(samples_model)
+                    for b in range(Rz.shape[0]):
+                        Un = evecs[b][:, M_SOURCES:]
+                        spectrum, _core = m_obj.spectrum_calculation(Un, f=1)
+                        _score("music",
+                               _music_preds_from_spectrum(spectrum, m_obj._angels, M_SOURCES),
+                               M_SOURCES, gt_b[b])
+            n_done += want
+            n_scored += want
+            if (capture_dir is not None and n_done - want <= capture_sample < n_done
+                    and capture_sample < len(generic_test_ds)):
+                for algo in algorithms:
+                    if algo in cap_store:
+                        continue
                     cap_store[algo] = True
-                    _capture(X, generic_test_ds[i][0], DOA, algo)
+                    off = capture_sample - (n_done - want)
+                    _capture(Xb[off:off + 1], generic_test_ds[capture_sample][0],
+                             DOAs[off], algo)
+    for algo in algorithms:
         results[f"SubNet+{algo}"] = dict(
-            rmspe_ref=agg["ref"] / n_used, rmspe_deg=agg["deg"] / n_used,
-            rmspe_fixed=agg["fixed"] / n_used, fail_rate=n_fail / n_used,
+            rmspe_ref=sub_agg[algo]["ref"] / n_scored,
+            rmspe_deg=sub_agg[algo]["deg"] / n_scored,
+            rmspe_fixed=sub_agg[algo]["fixed"] / n_scored,
+            fail_rate=sub_fail[algo] / n_scored,
         )
 
-        # --- 传统经验协方差 ---
+    for algo in algorithms:
+        # --- 传统经验协方差 (经典算法本身逐样本, 批不起来) ---
         agg = {"ref": 0.0, "deg": 0.0, "fixed": 0.0}
-        n_fail, n_used = 0, 0
+        n_fail, n_used_c = 0, 0
         for i, (X, DOA) in enumerate(generic_dl):
             if i >= n_eval:
                 break
             X = X[0].detach().cpu().numpy()
             gt = DOA.detach().cpu().numpy().ravel() * R2D
             if algo == "esprit":
-                preds, M = Esprit(samples_model).narrowband(X=X, mode="sample")
+                preds, M = esprit_classic.narrowband(X=X, mode="sample")
             elif algo == "music":
-                preds, _, M = MUSIC(samples_model).narrowband(X=X, mode="sample")
+                preds, _, M = music_classic.narrowband(X=X, mode="sample")
             else:
-                preds, _roots, _all, _rang, M = RootMUSIC(samples_model).narrowband(
+                preds, _roots, _all, _rang, M = rmus_classic.narrowband(
                     X=X, mode="sample"
                 )
             preds = np.asarray(preds, dtype=float).ravel()
@@ -865,10 +955,10 @@ def eval_on_test(scenario: str, value: float, model_test_ds, generic_test_ds,
             agg["ref"] += rmspe_reference(preds, gt)
             agg["deg"] += rmspe_degrees(preds, gt)
             agg["fixed"] += rmspe_degrees_fixed(preds, gt)
-            n_used += 1
+            n_used_c += 1
         results[algo] = dict(
-            rmspe_ref=agg["ref"] / n_used, rmspe_deg=agg["deg"] / n_used,
-            rmspe_fixed=agg["fixed"] / n_used, fail_rate=n_fail / n_used,
+            rmspe_ref=agg["ref"] / n_used_c, rmspe_deg=agg["deg"] / n_used_c,
+            rmspe_fixed=agg["fixed"] / n_used_c, fail_rate=n_fail / n_used_c,
         )
     return results
 
@@ -942,6 +1032,7 @@ def run(scenario: str, args):
             ckpt, args.algorithms, limit=args.limit,
             capture_dir=cap_dir if args.capture else None,
             capture_index=args.capture_index,
+            subnet_batch=max(1, args.eval_batch),
         )
         row = {sweep: value,
                "train_at": train_at,
@@ -1025,6 +1116,9 @@ def main():
     p.add_argument("--algorithms", nargs="+", default=["r-music", "esprit", "music"],
                    help="被增强/对比的算法: 三个都给才能出齐谱图 (r-music esprit music)")
     p.add_argument("--limit", type=int, default=0, help="评估样本上限, 0=全部")
+    p.add_argument("--eval_batch", type=int, default=1,
+                   help="SubNet 评估的分批大小: 1=逐样本 (默认, 与旧结果逐位一致); "
+                        ">1 时一个 batch 只前向一次, 三个算法共享 (见文档 §16.16)")
     p.add_argument("--force_data", action="store_true", help="强制重新生成数据集")
     p.add_argument("--device", type=str, default=None,
                    help="用哪块卡跑: default|cpu|cuda|cuda:2|2 "
