@@ -314,11 +314,11 @@ SUBSPACENET_DATA_ROOT=/data/subspacenet python reproduce_array_mismatch.py all -
 
 ### 7.1 上全量之前先跑环境自检
 
-同目录下的 `preflight_check.py` 用 **~1 分钟、只读、不留垃圾**的方式验证 14 项前置条件，
+同目录下的 `preflight_check.py` 用 **~1 分钟、只读、不留垃圾**的方式验证 15 项前置条件，
 任何 `[FAIL]` 都意味着全量跑（数小时）会失败或结论无效：
 
 ```bash
-python preflight_check.py          # 14 项静态+轻量检查
+python preflight_check.py          # 15 项静态+轻量检查
 python preflight_check.py --full   # 额外做一次真实训练冒烟（约 1 分钟）
 ```
 
@@ -326,7 +326,8 @@ python preflight_check.py --full   # 额外做一次真实训练冒烟（约 1 �
 import 前就必须可见 CUDA）、**GPU 上真的能算**（跑一次复数 `matmul` + `linalg.eig` 并 `synchronize`，
 这是唯一能识破"装了不含本机 sm 的 wheel"的检查，详见 §15）、关键文件在位、产物目录可写、
 **参数量 == 41761**、**RMSPE 缩放因子 == π/180**、**`nominal=True` 不再崩且 MUSIC 真能出数**、
-`create_dataset` 的二元组结构与张量形状、**失配真的进入数据**、**各失配水平共享同一批 DoA**。
+`create_dataset` 的二元组结构与张量形状、**失配真的进入数据**、**各失配水平共享同一批 DoA**、
+**`root_music` 的批量实现与逐样本原始实现等价**（回归保护，见 §16.6）。
 退出码 0 = 全部通过。自检也顺手充当了"论文数字 vs 本仓库行为"的回归测试——
 如果你改了源码导致参数量或 RMSPE 口径变了，它会立刻报出来。
 

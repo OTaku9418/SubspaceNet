@@ -330,6 +330,53 @@ def _shared_doa():
     assert np.allclose(got[0.0], got[0.15]), "不同 eta 抽到了不同 DoA，曲线不可比"
     return f"eta=0 与 eta=0.15 的 10 个样本 DoA 完全一致（seed=1234）"
 
+
+@check("root_music 的批量实现与逐样本原始实现等价")
+def _root_music_equivalence():
+    """src/models.py:744 的 root_music 已批量化（见文档 §16）。
+
+    这里做一次最小等价性验证：用 verify_root_music_batch.py 里内联保留的原始逐样本实现，
+    在同样的输入上比对 M 个 doa 与全部根 doa 的集合。训练会反传穿过这个函数，所以
+    "批量化改坏了数值" 是最需要被自动抓住的回归。
+    """
+    import torch
+    from src.models import ModelGenerator, root_music
+    from src.system_model import SystemModelParams
+    from src.utils import set_unified_seed
+    from verify_root_music_batch import root_music_reference
+
+    set_unified_seed(0)
+    p = (SystemModelParams().set_parameter("N", 8).set_parameter("M", 2)
+         .set_parameter("T", 100).set_parameter("snr", 10)
+         .set_parameter("signal_type", "NarrowBand")
+         .set_parameter("signal_nature", "non-coherent")
+         .set_parameter("eta", 0.0).set_parameter("bias", 0.0)
+         .set_parameter("sv_noise_var", 0.0))
+    model = (ModelGenerator().set_model_type("SubspaceNet")
+             .set_diff_method("root_music").set_tau(8).set_model(p)).model
+    model = model.to("cuda" if torch.cuda.is_available() else "cpu").eval()
+    dev = next(model.parameters()).device
+
+    worst = 0.0
+    for batch_size in (1, 8, 32):
+        x = torch.randn(batch_size, 8, 16, 8, device=dev)
+        with torch.no_grad():
+            Rz = model(x)[-1].detach()
+            ref_doa, ref_all, _ = root_music_reference(Rz, 2, batch_size)
+            new_doa, new_all, _ = root_music(Rz, 2, batch_size)
+        ref_doa, ref_all = ref_doa.to(dev), ref_all.to(dev)
+        # 原始实现把多项式求根落在 CPU（src/utils.py:147 的 device bug），故只比较值
+        worst = max(
+            worst,
+            (ref_doa - new_doa).abs().max().item(),
+            (ref_all.sort(dim=-1).values - new_all.sort(dim=-1).values).abs().max().item(),
+        )
+    assert worst < 1e-4, (
+        f"批量版 root_music 与原始实现的最大偏差 {worst:.3e} rad 超出容差 1e-4。"
+        "运行 `python verify_root_music_batch.py` 查看逐项明细。"
+    )
+    return f"batch 1/8/32 上最大偏差 {worst:.3e} rad（容差 1e-4）"
+
 # ------------------------------------------------------------------------------
 print()
 print("[5] 端到端训练（可选，--full）")
@@ -384,7 +431,7 @@ if N_FAIL:
 print()
 print("环境就绪。建议的全量起步命令：")
 print("  python reproduce_array_mismatch.py all --scenario spacing \\")
-print("      --n_train 10000 --n_test 5000 --epochs 80 --batch_size 1024 \\")
+print("      --n_train 45000 --n_test 5000 --epochs 80 --batch_size 1024 \\")
 print("      --algorithms r-music esprit music")
 print()
 print("注意：默认 --train_levels matched 会在 4 个 eta 上各训一个模型，")
