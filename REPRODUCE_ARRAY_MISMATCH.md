@@ -850,6 +850,7 @@ torch 从 2.0.1 跳到 2.7/2.8 跨了 7 个 minor，跑之前留意这几点：
 ## 16. 训练速度：热点定位与已做的两处改动
 
 这一节只讲**性能**，不改任何复现口径。如果你觉得训练太慢（例如一个 epoch 要几十分钟），先读这里再动手。
+**最快的自查方式**是在服务器上跑 `python bench_train.py`，它会逐段计时并与本机参考值并列，一眼看出是哪一段慢了几倍（§16.6）。
 
 ### 16.1 热点在 `root_music`，占了前向的 90% 以上
 
@@ -886,17 +887,19 @@ A = torch.diag(torch.ones(len(coefficients) - 2, dtype=coefficients.dtype), -1) 
 
 这个陷阱也是"服务器比我本机还慢"的原因：本机 GPU 慢，CPU 往返被计算掩住了；高端卡上 GPU 早早算完，只能干等 CPU 往返，比例反而放大。
 
-### 16.3 改动一：`root_music` 批量向量化（`src/models.py:693-806`）
+### 16.3 改动一：`root_music` 批量向量化（`src/models.py:698-800`）
 
 三个函数：
 
 | 函数 | 位置 | 作用 |
 |---|---|---|
-| `sum_of_diags_batched(matrix)` | `src/models.py:693` | `(B,N,N) → (B,2N-1)`，一次算完所有对角线（原版是 15 次独立 kernel） |
-| `find_roots_batched(coefficients)` | `src/models.py:720` | `(B,L) → (B,L-1)`，伴随矩阵**显式建在系数所在设备**上 |
-| `root_music(Rz, M, batch_size)` | `src/models.py:744` | 一次 batched EVD + gather + 噪声子空间投影；只有最后的"取 M 个根"仍是逐样本**切片**（不涉及算子） |
+| `sum_of_diags_batched(matrix)` | `src/models.py:698` | `(B,N,N) → (B,2N-1)`，一次算完所有对角线（原版是 15 次独立 kernel） |
+| `find_roots_batched(coefficients)` | `src/models.py:725` | `(B,L) → (B,L-1)`，伴随矩阵**显式建在系数所在设备**上 |
+| `root_music(Rz, M, batch_size)` | `src/models.py:749` | 全 batch 向量化：一次 EVD + gather + 噪声子空间投影 + **根的选择也用张量完成** |
 
 **为什么结果不变**：`F = U_n U_n^H` 对 `U_n` 的每一列尺度不变，所以批量 EVD 与逐样本 EVD 在特征向量归一化上的差异不影响 `F`；列顺序由 `argsort` 保证一致。返回值三元组的语义也保持一致（第三个仍是"最后一个样本的根"，与原实现的既有行为相同）。
+
+**根的选择**（最后一步）是最容易漏掉的一处：原实现是 `for i in range(batch_size)` 逐样本切片，看起来"不涉及算子所以不要紧"，实际上它每样本一次 `.item()`/索引操作，在 batch 1024 时让这一步独占 **172 ms**。现在用 `torch.where(outside, _SORT_SENTINEL, distance_to_circle)` 把所有"圆外的根"推到排序末尾，再 `argsort` + 切片，整段无 Python 循环。
 
 ### 16.4 改动二：验证集 DataLoader 的 batch（`src/training.py:284-286`）
 
@@ -905,6 +908,8 @@ A = torch.diag(torch.ones(len(coefficients) - 2, dtype=coefficients.dtype), -1) 
 
 ### 16.5 实测提速（RTX 4060 Laptop，T=100/N=8/τ=8）
 
+`root_music` 本身：
+
 | batch | 原始 ms | 批量 ms | 加速 | samples/s |
 |---|---|---|---|---|
 | 8 | 11.5 | 2.9 | 4.0× | 693 → 2739 |
@@ -912,16 +917,26 @@ A = torch.diag(torch.ones(len(coefficients) - 2, dtype=coefficients.dtype), -1) 
 | 256 | 337.3 | 54.2 | 6.2× | 759 → 4726 |
 | 1024 | 1485.1 | 223.0 | 6.7× | 690 → 4592 |
 
+上面的"批量 ms"是**只做循环批量化**的结果；再把最后那个逐样本的根选择也向量化（§16.3 末段）之后：
+
+| batch | 原始 ms | 批量+根选择向量化 ms | 加速 |
+|---|---|---|---|
+| 32 | 52.4 | 3.2 | 16.5× |
+| 256 | 373.3 | 14.0 | 26.7× |
+| 1024 | 1559.7 | 49.3 | **31.7×** |
+
 整步训练（forward + RMSPELoss + backward + Adam）：
 
-| batch | 原始 | 批量 |
-|---|---|---|
-| 256 | 1255 ms/step（204 samples/s） | **497 ms/step（516 samples/s）** |
-| 1024 | 5177 ms/step（198 samples/s） | **1900 ms/step（539 samples/s）** |
+| batch | 原始 | 批量 | 再向量化根选择 |
+|---|---|---|---|
+| 256 | 1255 ms/step（204 samples/s） | 497 ms/step（516 samples/s） | **353 ms/step（725 samples/s）** |
+| 1024 | 5177 ms/step（198 samples/s） | 1900 ms/step（539 samples/s） | **1287 ms/step（796 samples/s）** |
 
-峰值显存不变（batch 256 时 75 MiB、batch 1024 时 244 MiB）。换算到论文规模（40500 训练 + 4500 验证）：**每 epoch 约 4.4 分钟 → 约 1.5 分钟**；80 epoch 单模型约 6 h → 约 2 h。
+峰值显存不变（batch 256 时 75 MiB、batch 1024 时 244 MiB）。换算到论文规模（40500 训练 + 4500 验证），**每 epoch 约 61–64 秒**（batch 512 与 1024 差别很小，见 §16.6），80 epoch 单模型约 **1.4 小时**。
 
-### 16.6 怎么验证它没改坏数值
+**batch 怎么选**：从 2 到 1024 的实测看，batch ≥ 512 之后每样本成本已经平台化（0.205 → 0.202 ms/样本），batch=2 则要 6.3 ms/样本（**31 倍**）。所以**不要用小 batch 训练**——`--smoke` 的 512 是合适的，全量用 1024。
+
+### 16.6 怎么验证它没改坏数值 / 怎么定位服务器上的慢
 
 仓库根目录的 `verify_root_music_batch.py` 内联保留了改写前的**逐样本原始实现**，在同一批输入上逐项对比：
 
@@ -937,12 +952,31 @@ python verify_root_music_batch.py --quick   # 只做等价性
 - **反向**：对 `Rz` 的梯度相对偏差（容差 1e-2）。实测 **1.3e-5**。
 - **提速**：上面两张表。
 
+**定位"训练慢"该跑哪个**：用 `bench_train.py`，它逐段计时并给出本机参考值，一眼就能看出是哪一段慢了几倍：
+
+```bash
+python bench_train.py                       # --smoke 的配置 (batch=512)
+python bench_train.py --batch 2 256 1024    # 对比不同 batch 的每样本成本
+python bench_train.py --device cpu          # 排除"其实跑在 CPU 上"
+```
+
+本机（4060）参考输出：
+
+```
+数据生成  2000 样本 2.02 s  (1.008 ms/样本)
+batch=2     forward   3.8 ms/step   step   12.6 ms/step   吞吐 158.5 样本/s
+batch=512   forward 105.1 ms/step   step  772.3 ms/step   吞吐 662.8 样本/s
+batch=1024  forward 206.6 ms/step   step 1468.9 ms/step   吞吐 696.9 样本/s
+```
+
+判读方法：如果 `forward ÷ step`、或者每样本成本与上表的比例关系明显不对（例如 batch=512 的 step 超过 3 秒，或 batch=2 与 batch=512 的每样本成本差不多），说明瓶颈**不在** `root_music`，而在别处（数据搬运、验证集、或落到了 CPU）——把这三种 batch 的完整输出发回来即可定位。
+
 改动梯度路径意味着**最终 RMSPE 会有微小偏移**，所以换用这个版本后请重跑一次 `--smoke --force_data`，对照 §13.5 的表确认量级没变（η=0.025 时 SubNet+r-music ≈ 25.28°、r-music ≈ 4.07°）。已生成的数据集与权重格式不变，可以继续复用。
 
 ### 16.7 还没做的项（按性价比排序）
 
-1. **`esprit` 分支**（`src/models.py:813`）是同样的逐样本循环。论文主结果用的是 `root_music`，所以没动它；若你要用 `--diff_method esprit` 训练，需要同样处理。
-2. 两个评估用 DataLoader 加 `num_workers=4, pin_memory=True`（`reproduce_array_mismatch.py:710-711`）。
-3. `src/training.py:437` 每个 best epoch 都会 `copy.deepcopy(model.state_dict())`；改成存盘 + 结束回读可省一份拷贝峰值。
+1. **`esprit` 分支**（`src/models.py:818`）是同样的逐样本循环，且仍在调用有 CPU 回退的 `src/utils.py:147` `find_roots_torch`。论文主结果用的是 `root_music`，所以没动它；若你要用 `--diff_method esprit` 训练，需要同样处理。
+2. 两个评估用 DataLoader 加 `num_workers=4, pin_memory=True`（`reproduce_array_mismatch.py:710-711`）。注意数据是**内存里的张量列表**，不是磁盘 I/O，这项收益有限。
+3. `src/training.py:437` 每个 best epoch 都会 `copy.deepcopy(model.state_dict())`；改成存盘 + 结束回读可省一份拷贝峰值。模型只有 0.17 MB，收益也很小。
 
 

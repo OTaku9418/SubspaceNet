@@ -50,6 +50,11 @@ warnings.simplefilter("ignore")
 # Constants
 # device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
+_SORT_SENTINEL = 1e30
+"""Sort key used to push roots that lie outside the unit circle to the end of the ranking in
+root_music(). Large enough to exceed any |abs(root) - 1| that a polynomial of these
+coefficients can produce."""
+
 
 class ModelGenerator(object):
     """
@@ -789,21 +794,24 @@ def root_music(Rz: torch.Tensor, M: int, batch_size: int):
     doa_all_batches = torch.arcsin((1 / (2 * np.pi * dist * f)) * roots_angels_all)
 
     # Take only roots which are inside the unit circle, closest to it first. This reproduces
-    # the original `sorted(range(...), key=lambda k: abs(abs(roots[k]) - 1))` ordering.
-    sorted_indices = torch.argsort(torch.abs(torch.abs(roots) - 1), dim=1)
+    # the original `sorted(range(...), key=lambda k: abs(abs(roots[k]) - 1))` ordering, with
+    # out-of-circle roots pushed to the end so that the first valid_per_sample entries are the
+    # M roots the original per-sample loop would have kept.
+    distance_to_circle = torch.abs(torch.abs(roots) - 1)
+    outside = (torch.abs(roots) - 1) >= 0
+    sort_keys = torch.where(outside, _SORT_SENTINEL, distance_to_circle)
+    sorted_indices = torch.argsort(sort_keys, dim=1)
     roots_sorted = torch.gather(roots, 1, sorted_indices)
-    inside = (torch.abs(roots_sorted) - 1) < 0
-    # Keep the M roots closest to the unit circle that lie inside it
-    doa_batches = torch.stack(
-        [
-            torch.arcsin(
-                (1 / (2 * np.pi * dist * f))
-                * torch.angle(roots_sorted[i][inside[i]][:M])
-            )
-            for i in range(Rz.shape[0])
-        ],
-        dim=0,
-    )
+    # Number of usable roots per sample: M when every sample has >= M roots inside the circle
+    # (the normal case), fewer only when the shortage is shared by the whole batch.
+    valid_per_sample = int((~outside).sum(dim=1).min().item())
+    if valid_per_sample >= M:
+        selected = roots_sorted[:, :M]  # (B, M), no restriction needed
+    else:
+        selected = roots_sorted[:, :valid_per_sample]
+    angles = torch.angle(selected)
+    doa_batches = torch.arcsin((1 / (2 * np.pi * dist * f)) * angles)
+
     # As in the original implementation, the roots returned are those of the last sample
     roots_to_return = roots_sorted[-1]
 
