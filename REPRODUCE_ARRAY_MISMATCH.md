@@ -1102,7 +1102,7 @@ CUDA_VISIBLE_DEVICES=1 SUBSPACENET_DATA_ROOT=/data2/cyf/subn_b \
 
 **做法二：`--device`（**所有脚本都已支持**，包括正式的复现脚本）**
 
-`reproduce_array_mismatch.py`、`bench_step_split.py`、`bench_train.py`、`probe_forward_detail.py`、`profile_forward.py` 都支持 `--device default|cpu|cuda|cuda:2|2`。正式跑实验时可以这样直接指定：
+`reproduce_array_mismatch.py`、`bench_step_split.py`、`bench_train.py`、`probe_forward_detail.py` 都支持 `--device default|cpu|cuda|cuda:2|2`（`profile_forward.py` 没加，用它时请走 `CUDA_VISIBLE_DEVICES`）。正式跑实验时可以这样直接指定：
 
 ```bash
 python -u reproduce_array_mismatch.py all --scenario spacing \
