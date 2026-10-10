@@ -669,8 +669,10 @@ def train_one(scenario: str, value: float, train_ds, epochs: int, batch_size: in
         .set_criterion()
     )
     # 让训练循环用我们切出来的验证集
+    # batch 与训练集保持一致: 验证 loss 按样本数归一化(src/evaluation.py:117-118),
+    # 与 batch 无关, 故提速不影响任何报告数值。
     tparams.valid_dataset = torch.utils.data.DataLoader(
-        valid_ds, batch_size=1, shuffle=False, drop_last=False
+        valid_ds, batch_size=BATCH_SIZE, shuffle=False, drop_last=False
     )
     out_dir.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
