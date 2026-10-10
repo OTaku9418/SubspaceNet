@@ -187,16 +187,13 @@ def autocorrelation_matrix(X: torch.Tensor, lag: int):
         torch.Tensor: The autocorrelation matrix for the given lag.
 
     """
-    Rx_lag = torch.zeros(X.shape[0], X.shape[0], dtype=torch.complex128).to(device)
-    for t in range(X.shape[1] - lag):
-        # meu = torch.mean(X,1)
-        x1 = torch.unsqueeze(X[:, t], 1).to(device)
-        x2 = torch.t(torch.unsqueeze(torch.conj(X[:, t + lag]), 1)).to(device)
-        Rx_lag += torch.matmul(x1 - torch.mean(X), x2 - torch.mean(X)).to(device)
-    Rx_lag = Rx_lag / (X.shape[-1] - lag)
-    Rx_lag = torch.cat((torch.real(Rx_lag), torch.imag(Rx_lag)), 0)
-    return Rx_lag
-
+    L = X.shape[1] - lag
+    mu = X.mean()                       # 全局标量均值（见陷阱 1）
+    Xd = X.to(torch.complex128)
+    A = Xd[:, :L] - mu                  # 对应 x1 - mean(X)
+    B = Xd[:, lag:].conj() - mu         # 对应 conj(X[:, t+lag]) - mean(X)（见陷阱 2）
+    R = (A @ B.T) / L
+    return torch.cat((R.real, R.imag), 0)
 
 # def create_autocorrelation_tensor(X: torch.Tensor, tau: int) -> torch.Tensor:
 def create_autocorrelation_tensor(X: torch.Tensor, tau: int):

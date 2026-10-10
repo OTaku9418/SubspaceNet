@@ -77,8 +77,7 @@ T_SNAPSHOTS = 100      # 快拍数 T (论文未在 IV-B-4 明写, 取满足 AS4 
 SNR_DB = 10            # SNR
 TAU_LAGS = 8           # SubspaceNet 自相关最大 lag
 # 注: 式 (15) 的对角加载 eps = 1 由仓库硬编码在 src/models.py:387-389 的
-#     gram_diagonal_overload(Kx=Kx_tag, eps=1, batch_size=...) 里, 脚本无需(也无法)传参。
-N_TRAIN = 10000        # 训练样本数 (论文为 45000; 8GB 显存下 10000 是可行折中)
+N_TRAIN = 45000        # 训练样本数 (论文为 45000; 8GB 显存下 10000 是可行折中)
 N_TEST = 5000          # 测试样本数 = 论文的 5000 次 Monte Carlo
 N_VALID = 500          # 训练内验证集 (训练集额外留出)
 BATCH_SIZE = 1024      # 训练 batch (显存不够就往下降, 见 --batch_size)
