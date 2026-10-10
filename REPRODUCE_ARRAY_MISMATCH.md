@@ -1064,15 +1064,73 @@ doa_batches = -1 * torch.arcsin((1 / np.pi) * torch.angle(phi_eigenvalues))
 | 吞吐 | 663 样本/s | **1047 样本/s** | 1.6× |
 | 推算论文规模每 epoch | ≈ 64 s | **≈ 41 s** | 1.6× |
 
-**瓶颈已经换人了**：现在整步 489 ms 里 forward 只占 21.7 ms，**96% 在反向传播**。再想提速得换思路（混合精度、`torch.compile`、减少 `root_music` 反向的算子数），而不是继续找 Python 循环。反向的算子表（batch 512，本机）排前几位的是 `MinBackward1` 681 ms/1536 calls、`LinalgVectorNormBackward0` 512 ms/3072、`IndexSelectBackward0` 478 ms/3072、`aten::to` 466 ms/12324 —— 都是"每样本一次"的语义带来的 kernel 数量，不是某个单一大算子。
+（这张表是**改动六之前**的状态。加上 §16.13 的 `RMSPELoss` 批量化之后，整步从 488.8 ms 降到 **36.0 ms**、吞吐到 **14227 样本/s**、每 epoch **≈2.8 s**。）
+
+**当时以为瓶颈换人了**：那会儿看整步 489 ms 里 forward 只占 21.7 ms，于是判断"96% 在反向传播，再想提速得换思路"。**这个判断是错的** —— 反向那 96% 并不是"反向传播本身贵"，而是 `RMSPELoss` 的逐样本循环（§16.13）。教训：`forward(/no_grad/)` 与 `完整 step` 之间的差额**不等于**"反向传播的固有成本"，必须再用 `torch.profiler` 的设备侧时间表看一眼是谁在里面。
+
 
 ### 16.11 还没做的项（按性价比排序）
 
 1. **`src/utils.py:128` `find_roots_torch`**：伴随矩阵建在 CPU 上（§16.2 的陷阱）。`root_music` 用 `find_roots_batched`、`esprit` 已批量化，所以现在基本没有生产路径走它。
 2. 两个评估用 DataLoader 加 `num_workers=4, pin_memory=True`（`reproduce_array_mismatch.py:710-711`）。注意数据是**内存里的张量列表**，不是磁盘 I/O，收益有限。
 3. `src/training.py:437` 每个 best epoch 都会 `copy.deepcopy(model.state_dict())`；改成存盘 + 结束回读可省一份拷贝峰值。模型只有 0.17 MB，收益很小。
-4. **反向传播（占整步的 96%）**：需要混合精度或重写 `root_music` 的可微路径，属重活，暂不做。
-5. **`find_roots_batched` 里的 `torch.linalg.eigvals`**：见 §16.13，这是服务器上最后一个大头。
+4. **反向传播**：`RMSPELoss` 那部分已由 §16.13 解决。剩下的反向主要是 `SliceBackward0` / `DiagonalBackward0` 这类按根逐样本展开的小算子，收益递减。
+5. **`find_roots_batched` 里的 `torch.linalg.eigvals`**：见 §16.14。改动六之后它已经重新变成前向里最大的一项（本机 batch 512：`linalg_eig` + `linalg_eigvals` 合计占设备侧时间 37%），是服务器上**最后**一个大头。
+
+### 16.14 `find_roots_batched` 的 `eigvals`：为什么它慢，以及一条还没走完的路
+
+**它慢在哪**（全部本机实测，batch 512 的 14×14 复矩阵）：
+
+```
+eigvals complex64 (现状)   15.90 ms     eigvals float32          7.53 ms
+eigvals complex128         21.62 ms     eigvals float64         10.29 ms
+eigvals complex64 在 CPU   15.92 ms  <-- 与 GPU 完全相同
+eigvalsh 14x14 complex64    0.38 ms  <-- 快 42x
+n=8 5.673 | n=14 16.411 | n=16 21.435 | n=32 88.594 ms       (eigvals)
+n=8 0.375 | n=14  0.424 | n=16  0.446 | n=32  2.981 ms       (eigvalsh)
+分块 32/64/128/256: 19.5 / 16.6 / 16.0 / 16.6 ms（分块无益）
+torch.set_num_threads(1/2/4/8): 16.26 / 14.12 / 15.02 / 16.06 ms（无影响）
+preferred_linalg_library cusolver/magma: 15.82 / 16.59 ms（无影响）
+```
+
+⇒ 成本由**每矩阵固定开销**主导（8×8 与 14×14 只差 2.9×，远低于 O(n³) 的 5.4×），且**与设备无关**（CPU 上一样慢）。所以降次、换 dtype、换 device、换 linalg 后端都救不了；唯一出路是**别用非对称求解器**。
+
+**已确认的数学结构**：那个 15 系数多项式是**自逆（self-inversive）**的，`a_k = conj(a_{2m-k})`（实测残差 2.98e-08，float32 舍入量级；用 `R(z) = z^{2m} conj(p(1/conj z)) / p(z)` 判据得 `|R| = 1.000000 ± 3e-6`）。它的 14 个根**成"同角度、模互为倒数"的 7 对**：
+
+```
+sample 0: (-119.906,1.3992) (-119.906,0.7147)   <- 1/1.3992 = 0.7147
+          (-75.114,13.8636) (-75.114,0.0721)
+          ...
+|z| 分位数 0.356 / 0.541 / 1.001 / 1.849 / 2.809   (min 0.0721, max 13.86)
+```
+
+**注意根离单位圆非常远**。这直接判了另一条路的死刑：曾试过"在单位圆上粗扫 `|p(e^{iω})|`、取 M 个极小值当种子再做 Newton 复根"，实测 **29.3% 的样本误差超过 1 度、最大 77.7 度，且比它要替代的 `eigvals` 还慢 35 倍**。原因是前提就不成立 —— 极小值位置不对应根的角度，"离圆最近的根"排序里 rank 1 与 rank 2 平均隔 0.285，第 2 个源的角度在圆上根本找不到对应极小值。**这条路的失败是方法性的，不是调参问题。**
+
+**还没走完的路（已实测判定：走不通）**：同角度成对曾让人以为 `p(z) = z^7 P(z + 1/z)` 成立、7 个 `w = z + 1/z` 是实数（`1.3992 + 1/1.3992 = 2.1139` …），从而变成"7 次实系数多项式在 `[-2,2]` 上的实根问题"，可用**对称三对角 + 秩一**的 Chebyshev 伴随矩阵走 `eigvalsh`（同规模是 `eigvals` 的 **40 倍**）。
+
+**实测结论：这个降次不成立。** `.scratch_probe.py` 的输出：
+
+```
+max|a_k - conj(a_14-k)| / max|a| = 1.987e-08      <- 自逆成立（这才是同角度成对的来源）
+max|a_k - a_14-k|       / max|a| = 2.395e-01      <- palindromic 不成立
+max|Im a| / max|a|               = 1.198e-01      <- 系数本质上是复数
+
+[1] identity  p(z)/z^7 =?= P(w),  w = z + 1/z
+    残差（实系数 deg-7 P，只取 Re a）  : 3.051e-01
+    残差（复系数 deg-7 P，朴素做法）    : 6.101e-01
+    精确分解 A(w) + i(z-1/z)B̃(w) 的残差 : 1.069e-07   <- 这才是真正的恒等式
+    || i(z-1/z)B̃ || / ||A||（能量占比） : 0.2722
+
+[3] deg-7 P(w) 的根 vs 参考角度
+    实 P：frac real = 0.1473，frac(|w|<=2 且 real) = 0.0000
+          与参考角度的最大差 29.47 度、平均 7.37 度
+```
+
+⇒ **自逆只保证"根成同角度、倒数模的对"，并不保证能写成 `w = z + 1/z` 的 7 次多项式。** 那需要 `a_k` 全为实数（即同时是 palindromic），而实测虚部占比 12%、逐对 `|Im a_j|/|a_j|` 高达 0.47~0.69。真正的恒等式带一个 `i(z - 1/z) B̃(w)` 修正项，能量占比 27%，丢掉它残差就是 0.3 量级。所以这条路**不是"还没走完"，而是走不通**；`eigvals` 在这个结构下没有便宜的替代。
+
+**本文件曾写错、现已更正的两处**：① "降次后 `P(w)` 的根是复的、57% 不满足 `|Re(w)| ≤ 2`、不可用" —— 结论碰巧对，但当时给的理由（递推选错基）不完整，真正原因是上面这条；② "反向传播占 96%、是固有成本" —— 见 §16.10 的更正。
+
+
 
 ### 16.12 指定 CUDA 设备（多卡 / 多人共用机器）
 
@@ -1113,6 +1171,74 @@ watch -n 5 nvidia-smi --query-gpu=utilization.gpu,memory.used --format=csv   # �
 GPU 争用会造成的是**几倍以内**的抖动：本机同一段代码、同一台机器先后跑出 514 ms/step 与 660 ms/step（28% 差），当时另一个任务正在共用这张 4060（`nvidia-smi` 显示 33% 利用率）。所以：
 
 - 看到的劣化在**几倍以内** ⇒ 值得查占用、用上面的环境变量换一张空闲卡。
-- 看到的劣化是**几百倍**（服务器的 `eigvals` 对比本机是 430×）⇒ 换卡没用，原因在算子本身（§16.13）。
+- 看到的劣化是**几百倍**（服务器的 `eigvals` 对比本机是 430×）⇒ 换卡没用，原因在算子本身（§16.14）。
 
+### 16.13 改动六：`RMSPELoss` 也是逐样本循环 —— 这次是**反向**的大头
+
+这是服务器 `bench_step_split.py` 的结果把方向扭转过来之后才找到的。在指定空闲卡之后，服务器上 batch=512 的拆分成：
+
+```
+forward (no_grad)     365 ms   (713 us/样本)
+forward (带计算图)     422 ms
+backward only        5411 ms   <-- 93.8% 在这一行
+完整 step (含 Adam)   5849 ms   (11.4 ms/样本)   => 吞吐 87.5 样本/s
+```
+
+本机同一脚本是 forward 21 ms / backward 488 ms。**两台机器的前向差了 17 倍，反向只差 11 倍** —— 但真正反常的不是倍数，而是 `backward` 比 `forward` 大了 12.8 倍。前向里最大的单项是 `eigvals`，它本身只占 `forward` 的 4.8%，所以"反向那么贵"不可能来自某一两个算子，只能是**算子数量**。
+
+用 `torch.profiler` 看**设备侧**时间（`device_time_total`；用 `cpu_time_total` 看会得到近似为零的假象，因为 CUDA 异步），排第一的是：
+
+```
+autograd::engine::evaluate_function: MinBackward1   484 ms/call   1536 calls
+MinBackward1                                        460 ms/call   1536 calls
+```
+
+1536 = 3 步 × 512 样本，即**每样本一次**。来源是 `src/criterions.py` 的 `RMSPELoss.forward`：
+
+```python
+for iter in range(doa_predictions.shape[0]):        # 512 次
+    ...
+    prediction_perm = permute_prediction(batch_predictions)
+    for prediction in prediction_perm:               # M! 次
+        error = (((prediction - targets) + (np.pi / 2)) % np.pi) - np.pi / 2
+        rmspe_list.append((1 / np.sqrt(len(targets))) * torch.linalg.norm(error))
+    rmspe.append(torch.min(torch.stack(rmspe_list, dim=0)))   # <-- 隐式同步
+return torch.sum(torch.stack(rmspe, dim=0))
+```
+
+即 `batch × M!` 次微小的归约，每次前面还有一次 `torch.min` 带来的**主机/设备同步**。GPU 算得再快也没用：它每算一个 2 元素的 min 就要等一次 CPU。
+
+**改法**（`src/criterions.py`，同时把 `MSPELoss` 一起改，两者结构相同；新增 `permute_prediction_batched` 作为 `permute_prediction` 的批量版）：
+
+```python
+prediction_perm = permute_prediction_batched(doa_predictions).to(device)  # [B, M!, M]
+error = (((prediction_perm - doa.unsqueeze(1)) + (np.pi / 2)) % np.pi) - np.pi / 2
+rmspe_val = (1 / np.sqrt(doa.shape[-1])) * torch.linalg.norm(error, dim=-1)  # [B, M!]
+return torch.min(rmspe_val, dim=1).values.sum()
+```
+
+注意三处**不能改**的语义：① 最后是 `sum` 不是 `mean`（所以打印出的 loss 随 batch 线性增长，这是原样保留的）；② 归一化是 `1/sqrt(M)`、且 `torch.linalg.norm(error)` 取的是**整个 [M] 向量的 L2**，不是按元素；③ 每个样本内部那 M! 次计算的顺序**逐位不变**，因此结果不是"近似相同"。
+
+**实测等价性（`verify_batched_ops.py` 的 `check_loss`，M=2/3 × batch 1/8/512）**：
+
+| 量 | 结果 |
+|---|---|
+| loss 差 | **0.000e+00**（逐位相同） |
+| 梯度相对差 | **0.000e+00**（逐位相同） |
+
+**实测提速（本机 RTX 4060 Laptop，batch 512，`bench_step_split.py`）**：
+
+| 阶段 | 改前 | 改后 | 倍数 |
+|---|---|---|---|
+| forward（带计算图） | 29.4 ms | 28.7 ms | — |
+| **backward only** | **487.5 ms** | **7.4 ms** | **66×** |
+| **完整 step（含 Adam）** | **514.4 ms** | **36.0 ms** | **14.3×** |
+| 吞吐 | 1047 样本/s | **14227 样本/s** | 13.6× |
+| 推算论文规模每 epoch | 40.8 s | **2.8 s** | 14.6× |
+
+batch=2 同时从 13.7 ms/step 降到 10.0 ms/step（小 batch 下反向本来就没多少活，收益自然小）。
+
+**服务器上预期**：那条 5411 ms 的 `backward` 主体就是这个循环，按本机比例应落到 60 ms 量级，整步从 5849 ms 降到 **400 ms 上下**（≈13×），每 epoch 从 2420 s 量级降到 **≈180 s**。请用 `python bench_step_split.py --batch 2 512 --device 1` 复验。
+
+**改完之后瓶颈又换人了**（本机 batch 512，设备侧时间）：`aten::linalg_eig` 与 `aten::linalg_eigvals` 合计占 37%，`Optimizer.step#Adam.step` 占 2%，其余是 `SliceBackward0` / `DiagonalBackward0` / `copy_` / `zeros` 这类分散的小算子。**现在反向已经比前向便宜了（7.4 ms vs 28.7 ms），前向重新成为大头**，而前向里能动的就是最后那一项 `eigvals` —— 见 §16.14。
 

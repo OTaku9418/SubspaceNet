@@ -34,6 +34,29 @@ import torch
 from itertools import permutations
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu");
 
+def permute_prediction_batched(predictions: torch.Tensor):
+    """All permutations of every prediction vector in a batch, as one gather.
+
+    Batched equivalent of :func:`permute_prediction`, which is called once per sample inside a
+    Python loop. The permutation index table is built once per call and used to index the whole
+    batch at once.
+
+    Args:
+    -----
+        predictions (torch.Tensor): shape [Batch size, M].
+
+    Returns:
+    --------
+        torch.Tensor: shape [Batch size, M!, M], where entry [b, p] is
+        ``predictions[b]`` reordered by the p-th permutation.
+    """
+    m = predictions.shape[-1]
+    perms = torch.tensor(
+        list(permutations(range(m), m)), dtype=torch.long, device=predictions.device
+    )
+    return predictions[:, perms]
+
+
 def permute_prediction(prediction: torch.Tensor):
     """
     Generates all the available permutations of the given prediction tensor.
@@ -104,25 +127,25 @@ class RMSPELoss(nn.Module):
 
         Raises:
             None
+
+        Note:
+        -----
+            Batched re-implementation of the original per-sample loop. The loop issued one
+            ``permute_prediction``, ``torch.linalg.norm``, ``torch.stack`` and ``torch.min`` per
+            sample per permutation -- i.e. ``batch * M!`` tiny reductions, each preceded by a
+            host/device synchronization from the ``.item()`` inside ``torch.min``. On a training
+            step of batch 512 that made this criterion the single most expensive part of the step,
+            several times the cost of the whole forward pass. Every operation below is vectorized
+            over the batch; the arithmetic is unchanged, so the returned loss and the gradient are
+            bit-identical to the loop (see ``bench_step_split.py`` and the repository notes).
         """
-        rmspe = []
-        for iter in range(doa_predictions.shape[0]):
-            rmspe_list = []
-            batch_predictions = doa_predictions[iter].to(device)
-            targets = doa[iter].to(device)
-            prediction_perm = permute_prediction(batch_predictions).to(device)
-            for prediction in prediction_perm:
-                # Calculate error with modulo pi
-                error = (((prediction - targets) + (np.pi / 2)) % np.pi) - np.pi / 2
-                # Calculate RMSE over all permutations
-                rmspe_val = (1 / np.sqrt(len(targets))) * torch.linalg.norm(error)
-                rmspe_list.append(rmspe_val)
-            rmspe_tensor = torch.stack(rmspe_list, dim = 0)
-            # Choose minimal error from all permutations
-            rmspe_min = torch.min(rmspe_tensor)
-            rmspe.append(rmspe_min)
-        result = torch.sum(torch.stack(rmspe, dim = 0))
-        return result
+        # [B, M!] RMSPE of every permutation of every sample: all permutations at once, then the
+        # same modulo-pi wrap-up the loop applied one prediction at a time.
+        prediction_perm = permute_prediction_batched(doa_predictions).to(device)  # [B, M!, M]
+        error = (((prediction_perm - doa.unsqueeze(1)) + (np.pi / 2)) % np.pi) - np.pi / 2
+        rmspe_val = (1 / np.sqrt(doa.shape[-1])) * torch.linalg.norm(error, dim=-1)  # [B, M!]
+        # Minimal error over all permutations, per sample, then the sum over the batch.
+        return torch.min(rmspe_val, dim=1).values.sum()
 
 class MSPELoss(nn.Module):
     """Mean Square Periodic Error (MSPE) loss function.
@@ -167,25 +190,16 @@ class MSPELoss(nn.Module):
 
         Raises:
             None
+
+        Note:
+        -----
+            Batched re-implementation of the original per-sample loop; see the note on
+            :meth:`RMSPELoss.forward`. Same arithmetic, so the loss and gradient are unchanged.
         """
-        rmspe = []
-        for iter in range(doa_predictions.shape[0]):
-            rmspe_list = []
-            batch_predictions = doa_predictions[iter].to(device)
-            targets = doa[iter].to(device)
-            prediction_perm = permute_prediction(batch_predictions).to(device)
-            for prediction in prediction_perm:
-                # Calculate error with modulo pi
-                error = (((prediction - targets) + (np.pi / 2)) % np.pi) - np.pi / 2
-                # Calculate MSE over all permutations
-                rmspe_val = (1 / len(targets)) * (torch.linalg.norm(error) ** 2)
-                rmspe_list.append(rmspe_val)
-            rmspe_tensor = torch.stack(rmspe_list, dim = 0)
-            rmspe_min = torch.min(rmspe_tensor)
-            # Choose minimal error from all permutations
-            rmspe.append(rmspe_min)
-        result = torch.sum(torch.stack(rmspe, dim = 0))
-        return result
+        prediction_perm = permute_prediction_batched(doa_predictions).to(device)  # [B, M!, M]
+        error = (((prediction_perm - doa.unsqueeze(1)) + (np.pi / 2)) % np.pi) - np.pi / 2
+        rmspe_val = (1 / doa.shape[-1]) * (torch.linalg.norm(error, dim=-1) ** 2)  # [B, M!]
+        return torch.min(rmspe_val, dim=1).values.sum()
 
 def RMSPE(doa_predictions: np.ndarray, doa: np.ndarray):
     """

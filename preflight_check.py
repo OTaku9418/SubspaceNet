@@ -402,6 +402,57 @@ def _gram_equivalence():
     return f"batch 1/8/64 上最大偏差 {worst:.3e}（容差 1e-4）"
 
 
+@check("RMSPELoss 的批量实现与逐样本原始实现等价（loss 与梯度）")
+def _rmspe_loss_equivalence():
+    """src/criterions.py 的 RMSPELoss.forward 原本是逐样本 + 逐排列的循环（文档 §16.13）。
+
+    这是训练路径上最贵的一段：batch * M! 次微小的归约，每次前面还有 torch.min 的
+    隐式同步。批量版必须与原实现给出同一个 loss 和同一个梯度，否则换掉它就等于换了目标函数。
+    """
+    import numpy as np
+    import torch
+
+    from src.criterions import RMSPELoss, permute_prediction
+    from src.utils import device
+
+    def reference(predictions, targets):
+        rmspe = []
+        for index in range(predictions.shape[0]):
+            rmspe_list = []
+            for prediction in permute_prediction(predictions[index].to(device)):
+                error = (((prediction - targets[index].to(device)) + (np.pi / 2)) % np.pi) - np.pi / 2
+                rmspe_list.append(
+                    (1 / np.sqrt(targets.shape[-1])) * torch.linalg.norm(error)
+                )
+            rmspe.append(torch.min(torch.stack(rmspe_list, dim=0)))
+        return torch.sum(torch.stack(rmspe, dim=0))
+
+    criterion = RMSPELoss()
+    worst_loss, worst_grad = 0.0, 0.0
+    for m in (2, 3):
+        for batch_size in (1, 8, 128):
+            predictions = torch.rand(batch_size, m, device=device) * np.pi - np.pi / 2
+            targets = torch.rand(batch_size, m, device=device) * np.pi - np.pi / 2
+
+            p_new = predictions.clone().requires_grad_(True)
+            criterion(p_new, targets).backward()
+            p_ref = predictions.clone().requires_grad_(True)
+            reference(p_ref, targets).backward()
+
+            worst_loss = max(worst_loss, abs(
+                criterion(predictions, targets).item() - reference(predictions, targets).item()
+            ))
+            scale = max(p_ref.grad.abs().max().item(), 1e-12)
+            worst_grad = max(worst_grad, (p_new.grad - p_ref.grad).abs().max().item() / scale)
+
+    assert worst_loss < 1e-4 and worst_grad < 1e-5, (
+        f"批量版 RMSPELoss 与原始实现不一致：loss 差 {worst_loss:.3e}、梯度相对差 "
+        f"{worst_grad:.3e}。这会让训练目标与论文/历史结果不再可比。"
+        "运行 `python verify_batched_ops.py` 查看明细。"
+    )
+    return f"M=2/3、batch 1/8/128 上 loss 差 {worst_loss:.3e}、梯度相对差 {worst_grad:.3e}"
+
+
 @check("esprit 的批量实现与逐样本原始实现等价（仅 esprit 分支）")
 def _esprit_equivalence():
     """src/models.py 的 esprit 原本是逐样本循环（文档 §16.9）。

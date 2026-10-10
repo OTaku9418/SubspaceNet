@@ -10,6 +10,8 @@ Covered:
   1. src/models.py  root_music()            (see verify_root_music_batch.py for the
                                              standalone deep comparison + speedup table)
   2. src/utils.py   gram_diagonal_overload()
+  3. src/criterions.py RMSPELoss.forward()  (loss and gradient, against the original
+                                             per-sample loop kept in this file)
 
 Exit code 0 = every check passed.
 
@@ -22,8 +24,10 @@ import argparse
 import sys
 import time
 
+import numpy as np
 import torch
 
+from src.criterions import permute_prediction
 from src.models import root_music, sum_of_diags_batched
 from src.utils import device, gram_diagonal_overload, gram_diagonal_overload_reference
 from verify_root_music_batch import root_music_reference
@@ -72,12 +76,61 @@ def check_gram(batches):
     return worst
 
 
+def rmspe_loss_reference(predictions, targets):
+    """The original per-sample RMSPELoss body, kept here verbatim for the equivalence check.
+
+    `src/criterions.py:RMSPELoss.forward` no longer contains this loop; it is the reference this
+    script compares against, so it must not be "un-vectorized" later by mistake.
+    """
+    rmspe = []
+    for index in range(predictions.shape[0]):
+        rmspe_list = []
+        batch_predictions = predictions[index].to(device)
+        sample_targets = targets[index].to(device)
+        for prediction in permute_prediction(batch_predictions):
+            error = (((prediction - sample_targets) + (np.pi / 2)) % np.pi) - np.pi / 2
+            rmspe_val = (1 / np.sqrt(len(sample_targets))) * torch.linalg.norm(error)
+            rmspe_list.append(rmspe_val)
+        rmspe.append(torch.min(torch.stack(rmspe_list, dim=0)))
+    return torch.sum(torch.stack(rmspe, dim=0))
+
+
+def check_loss():
+    """RMSPELoss: the vectorized forward vs the original per-sample loop, loss AND gradient."""
+    from src.criterions import RMSPELoss
+
+    print("[2/3] RMSPELoss 等价性 (批量版 vs 逐样本原始实现, 含梯度)")
+    criterion = RMSPELoss()
+    worst_loss, worst_grad = 0.0, 0.0
+    for m in (2, 3):
+        for batch_size in (1, 8, 512):
+            predictions = torch.rand(batch_size, m, device=device) * np.pi - np.pi / 2
+            targets = torch.rand(batch_size, m, device=device) * np.pi - np.pi / 2
+
+            p_new = predictions.clone().requires_grad_(True)
+            l_new = criterion(p_new, targets)
+            l_new.backward()
+
+            p_ref = predictions.clone().requires_grad_(True)
+            l_ref = rmspe_loss_reference(p_ref, targets)
+            l_ref.backward()
+
+            d_loss = abs(l_new.item() - l_ref.item())
+            scale = max(p_ref.grad.abs().max().item(), 1e-12)
+            d_grad = (p_new.grad - p_ref.grad).abs().max().item() / scale
+            worst_loss, worst_grad = max(worst_loss, d_loss), max(worst_grad, d_grad)
+            flag = "OK" if (d_loss < 1e-4 and d_grad < 1e-5) else "FAIL"
+            print(f"  M={m} batch={batch_size:5d}  loss 差 {d_loss:.3e}  "
+                  f"梯度相对差 {d_grad:.3e}   [{flag}]")
+    return worst_loss, worst_grad
+
+
 def check_speed(batch_size=512, quick=False):
     """两处改动的提速比（仅供参考）。"""
     from src.models import find_roots_batched
     from src.utils import find_roots_torch
 
-    print("\n[2/2] 提速比 (本机, 仅供参考)")
+    print("\n[3/3] 提速比 (本机, 仅供参考)")
     Kx = (
         torch.randn(batch_size, 8, 8, dtype=torch.complex64, device=device)
         + 1j * torch.randn(batch_size, 8, 8, dtype=torch.complex64, device=device)
@@ -117,12 +170,14 @@ def main():
     batches = (1, 8) if args.quick else (1, 8, 512)
 
     worst = check_gram(batches)
+    worst_loss, worst_grad = check_loss()
     check_speed(quick=args.quick)
 
     print("\n=== 汇总 ===")
     print(f"  gram 最大偏差 {worst:.3e} (容差 {TOLERANCE_GRAM})")
+    print(f"  RMSPELoss loss 差 {worst_loss:.3e} / 梯度相对差 {worst_grad:.3e}")
     print(f"  root_music 的等价性与提速见 `python verify_root_music_batch.py`")
-    if worst >= TOLERANCE_GRAM:
+    if worst >= TOLERANCE_GRAM or worst_loss >= 1e-4 or worst_grad >= 1e-5:
         print("  结论: 存在超差项, 请勿使用当前实现")
         sys.exit(1)
     print("  结论: 通过")
