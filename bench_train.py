@@ -84,6 +84,16 @@ def _early_device():
     project_utils.device = chosen
     if chosen.type == "cuda" and chosen.index:
         torch.cuda.set_device(chosen.index)
+
+    # `src.training` / `src.evaluation` / `src.models` 用的是 `from src.utils import device`
+    # (或 import *), 那是**值绑定**: 它们各自持有一份拷贝, 只改 `src.utils.device` 不够.
+    import src.evaluation
+    import src.models
+    import src.training
+
+    for module in (src.evaluation, src.models, src.training):
+        if hasattr(module, "device"):
+            module.device = chosen
     return chosen
 
 

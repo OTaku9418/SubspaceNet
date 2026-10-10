@@ -51,6 +51,10 @@ def _early_device():
     ``src.models`` binds it at import time, so a script cannot change the device after the
     fact. Parsing the one flag from ``sys.argv`` here and patching the constant immediately
     keeps every downstream module on the requested device without touching repository code.
+
+    Note that ``src.training`` / ``src.evaluation`` / ``src.models`` do
+    ``from src.utils import device`` (a *value* binding), so they each hold their own copy:
+    patching ``src.utils.device`` alone is not enough, every copy has to be rebound.
     """
 
     spec = None
@@ -69,6 +73,15 @@ def _early_device():
     _project_utils.device = chosen
     if chosen.type == "cuda" and chosen.index:
         torch.cuda.set_device(chosen.index)
+
+    import src.criterions
+    import src.evaluation
+    import src.models
+    import src.training
+
+    for module in (src.criterions, src.evaluation, src.models, src.training):
+        if hasattr(module, "device"):
+            module.device = chosen
     return chosen
 
 

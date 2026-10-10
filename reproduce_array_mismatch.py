@@ -60,13 +60,65 @@ ROOT = Path(__file__).resolve().parent
 DATA_ROOT = Path(os.environ.get("SUBSPACENET_DATA_ROOT", ROOT / "data"))
 sys.path.insert(0, str(ROOT))
 
+
+def _early_device():
+    """在任何人 import `src.*` 之前解析 `--device` 并改写 `src.utils.device`。
+
+    `src.utils.device`（`src/utils.py:32`）是导入期常量, `src.data_handler` / `src.models`
+    等模块在 import 时各自绑定一份, 所以 import 之后再改就晚了 ---- 必须在 `from src...`
+    之前把 `sys.argv` 里的这一个参数取出来。
+
+    多卡机器上两种做法等价, 任选其一:
+      * `CUDA_VISIBLE_DEVICES=1 python ...`        ---- 零改动, 可见卡会重新编号成 cuda:0
+      * `python ... --device 1`                    ---- 本函数, 不改环境变量
+    两者同时用也没问题: `--device` 的索引是在"可见卡"里数, 不是物理号。
+    """
+    spec = None
+    argv = sys.argv[1:]
+    for position, token in enumerate(argv):
+        if token == "--device":
+            if position + 1 < len(argv):
+                spec = argv[position + 1]
+            break
+        if token.startswith("--device="):
+            spec = token.split("=", 1)[1]
+            break
+
+    import src.utils as _utils
+
+    if not spec or spec == "default":
+        return _utils.device
+    chosen = _utils.resolve_device(spec)
+    _utils.device = chosen
+    if chosen.type == "cuda" and chosen.index:
+        torch.cuda.set_device(chosen.index)
+
+    # `src.training` / `src.evaluation` / `src.models` 用的是 `from src.utils import device`
+    # (或 import *), 那是**值绑定**: 它们各自持有一份拷贝, 只改 `src.utils.device` 不够。
+    # 这里在它们被 import 之前把要用的那几个模块先导进来并逐份改写。
+    import src.criterions
+    import src.data_handler
+    import src.evaluation
+    import src.models
+    import src.training
+
+    for module in (src.criterions, src.data_handler, src.evaluation, src.models, src.training):
+        if hasattr(module, "device"):
+            module.device = chosen
+    return chosen
+
+
+DEVICE = _early_device()
+
 from src.data_handler import create_dataset, read_data  # noqa: E402
 from src.methods import Esprit, MUSIC, RootMUSIC  # noqa: E402
 from src.models import ModelGenerator  # noqa: E402
 from src.plotting import initialize_figures  # noqa: E402
 from src.system_model import SystemModel, SystemModelParams  # noqa: E402
 from src.training import TrainingParams, train_model  # noqa: E402
-from src.utils import R2D, device, set_unified_seed  # noqa: E402
+from src.utils import R2D, set_unified_seed  # noqa: E402
+
+device = DEVICE          # 本模块其余代码沿用它, 与改写后的 src.utils.device 保持一致
 
 # ------------------------------------------------------------------------------
 # 实验配置: 论文里的固定量都在这里
@@ -836,6 +888,14 @@ def run(scenario: str, args):
         n_train, n_test, epochs, batch_size = 2000, 200, 3, 512
         print("*** SMOKE 模式: 小数据/少轮次, 只验证流程能否跑通 ***")
 
+    # 0) 设备: 显式打印出来, 免得"以为在卡 1 上跑"结果落在别人占用的卡 0 上.
+    #    (device 已在模块导入前由 _early_device() 按 --device 定好)
+    if device.type == "cuda":
+        print(f"[设备] {device}  {torch.cuda.get_device_name(device)}  "
+              f"(CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '未设置')})")
+    else:
+        print(f"[设备] {device}  (全量训练不建议用 CPU)")
+
     # 1) 用哪个失配水平训练 —— 这是 Fig.9 复现里最关键的协议选择.
     #
     #    论文原文只说明被比较的方法"均在同一批数据上训练", 没有把"训练时失配水平"
@@ -966,6 +1026,9 @@ def main():
                    help="被增强/对比的算法: 三个都给才能出齐谱图 (r-music esprit music)")
     p.add_argument("--limit", type=int, default=0, help="评估样本上限, 0=全部")
     p.add_argument("--force_data", action="store_true", help="强制重新生成数据集")
+    p.add_argument("--device", type=str, default=None,
+                   help="用哪块卡跑: default|cpu|cuda|cuda:2|2 "
+                        "(默认 default = 按 CUDA_VISIBLE_DEVICES 重编号后的 cuda:0)")
     p.add_argument("--smoke", action="store_true",
                    help="小规模冒烟测试 (网格自动缩到 2 个点)")
     # --- 出图 (全部 PNG) ---

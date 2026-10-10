@@ -298,7 +298,8 @@ python reproduce_array_mismatch.py all --scenario spacing --limit 200
 `--train_levels matched|single`（**默认 matched = 逐点匹配训练，忠实复现 Fig.9**；single 见上）、
 `--train_at`（仅 `--train_levels single` 时生效）、`--grid`（评估网格，逗号分隔）、
 `--algorithms r-music esprit music`（默认三个都给）、`--limit`（评估样本上限，0=全部）、
-`--force_data`（强制重新生成数据集）、`--smoke`（2000 样本/3 epoch 的小规模冒烟；且未显式给 `--grid` 时只跑首尾两个失配水平）。
+`--force_data`（强制重新生成数据集）、`--smoke`（2000 样本/3 epoch 的小规模冒烟；且未显式给 `--grid` 时只跑首尾两个失配水平）、
+`--device default|cpu|cuda|cuda:2|2`（用哪块卡跑，见 §16.13；默认 `default` = 按 `CUDA_VISIBLE_DEVICES` 重编号后的 `cuda:0`）。
 
 出图相关参数（详见 **§14**）：子命令 `plot`（从已有 JSON 重画曲线图，不重跑实验）、
 `--json`（`plot` 用，可给多个结果 JSON）、`--metrics deg ref`、`--fig_dir`（PNG 输出目录）、
@@ -1099,9 +1100,25 @@ CUDA_VISIBLE_DEVICES=1 SUBSPACENET_DATA_ROOT=/data2/cyf/subn_b \
 
 关键点：`CUDA_VISIBLE_DEVICES` **会把可见卡重新编号**，所以代码里的 `cuda:0` 自动映射到你选的那张，不需要改任何源码。多进程训练时 `torchrun` 的 `local_rank` 同理（它是可见卡的序号，不是物理号）。
 
-**做法二：`--device`（基准/探针脚本已支持）**
+**做法二：`--device`（**所有脚本都已支持**，包括正式的复现脚本）**
 
-`bench_step_split.py`、`bench_train.py`、`probe_forward_detail.py`、`profile_forward.py` 支持 `--device default|cpu|cuda|cuda:2|2`。实现方式是在**导入 `src` 之前**从 `sys.argv` 里取出该参数并改写 `src.utils.device`（`src.models` 等模块在 import 时就把常量绑定了，import 之后再改无效）。业务脚本（`main.py`、`reproduce_array_mismatch.py`）没加，用环境变量即可。
+`reproduce_array_mismatch.py`、`bench_step_split.py`、`bench_train.py`、`probe_forward_detail.py`、`profile_forward.py` 都支持 `--device default|cpu|cuda|cuda:2|2`。正式跑实验时可以这样直接指定：
+
+```bash
+python -u reproduce_array_mismatch.py all --scenario spacing \
+    --n_train 45000 --n_test 5000 --epochs 80 --batch_size 1024 \
+    --device 1 > run.log 2>&1 &
+```
+
+启动时会先打印一行设备确认，免得"以为在卡 1 上跑"结果落在别人占用的卡 0 上：
+
+```
+[设备] cuda:1  NVIDIA RTX PRO 6000 Blackwell Server Edition  (CUDA_VISIBLE_DEVICES=未设置)
+```
+
+实现方式是在**导入 `src` 之前**从 `sys.argv` 里取出该参数并改写 `src.utils.device`。这里有一个容易漏的细节：`src.training` / `src.evaluation` / `src.models` 用的是 `from src.utils import device`（`import *` 同理），那是**值绑定**——它们各自持有一份拷贝，所以脚本必须把这几份**逐份改写**，只改 `src.utils.device` 不够。`_early_device()` 已经这么做了。
+
+`--device 2` 的 `2` 是**可见卡**里的序号，不是物理号：如果同时设了 `CUDA_VISIBLE_DEVICES=5,6`，那 `--device 1` 指的是物理 6 号卡。`main.py` 仍没加（它是官方 demo，改源码或直接用环境变量即可）。
 
 **怎么确认卡有没有被别人占：**
 

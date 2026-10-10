@@ -45,6 +45,10 @@ def _early_device():
 
     ``CUDA_VISIBLE_DEVICES=3`` is the alternative and needs no flag at all: it renumbers the
     visible GPUs, so the hard-coded `cuda:0` lands on physical GPU 3.
+
+    Note that ``src.training`` / ``src.evaluation`` / ``src.models`` do
+    ``from src.utils import device`` (a *value* binding), so they each hold their own copy:
+    patching ``src.utils.device`` alone is not enough, every copy has to be rebound.
     """
 
     import src.utils as project_utils
@@ -65,6 +69,14 @@ def _early_device():
     project_utils.device = chosen
     if chosen.type == "cuda" and chosen.index:
         torch.cuda.set_device(chosen.index)
+
+    import src.evaluation
+    import src.models
+    import src.training
+
+    for module in (src.evaluation, src.models, src.training):
+        if hasattr(module, "device"):
+            module.device = chosen
     return chosen
 
 
