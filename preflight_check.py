@@ -85,7 +85,7 @@ def _deps():
     return "  ".join(f"{k}={v}" for k, v in got.items())
 
 
-@check("CUDA 可用（src/utils.py 的 device 在 import 时定型）")
+@check("cuda.is_available()")
 def _cuda():
     import torch
     avail = torch.cuda.is_available()
@@ -95,6 +95,62 @@ def _cuda():
     total = torch.cuda.get_device_properties(0).total_memory / 1024**3
     cap = torch.cuda.get_device_capability(0)
     return f"{name}, {total:.1f} GiB, compute capability {cap}"
+
+
+@check("GPU 上真的能算（复数 matmul + linalg.eig，带同步）")
+def _cuda_kernel():
+    """★最重要的 CUDA 检查: 跑一次真实 kernel 并 synchronize。
+
+    必要性: `torch.cuda.is_available()` 只检查"驱动能看见卡", **不检查**
+    "这个 torch 构建里有没有该架构的 kernel"。装了不含本机 sm 的 wheel 时它照样
+    返回 True, 然后在第一次真正算东西时抛
+    `CUDA error: no kernel image is available for execution on the device`。
+    而且 CUDA 的 kernel 错误是**异步**报告的, 不同步就会在后面的随机位置炸出来
+    （实测就是这样: 前面几项全 PASS, 到 MUSIC 才 FAIL）——所以这里必须同步。
+    """
+    import torch
+    from src.utils import device as dev
+
+    if dev.type != "cuda":
+        raise AssertionError(f"src/utils.py:32 的 device={dev}，不是 cuda")
+    try:
+        a = torch.randn(64, 64, dtype=torch.complex64, device=dev)
+        b = torch.randn(64, 64, dtype=torch.complex64, device=dev)
+        (a @ b).sum().real.item()
+        torch.linalg.eig(a + a.conj().T)
+        torch.cuda.synchronize()
+    except RuntimeError as e:
+        if "no kernel image is available" in str(e):
+            archs = " / ".join(torch.cuda.get_arch_list())
+            raise AssertionError(
+                f"本机 GPU ({torch.cuda.get_device_name(0)}, compute capability "
+                f"{torch.cuda.get_device_capability(0)}) 在这个 torch 构建里没有可用 "
+                f"kernel。torch {torch.__version__} 只编译了 [{archs}]。"
+                "装的是老 wheel（如仓库 pyEnv/requirements.txt 锁的 torch==2.0.1，"
+                "只到 sm_86）。换装支持新架构的构建：PyTorch >= 2.7 的 cu128 wheel，"
+                "见文档 §15") from e
+        raise
+    return f"device={dev}, 复数 matmul 与 linalg.eig 均通过"
+
+
+@check("（提示）GPU 架构是否在 torch 编译目标里，缺了会走 PTX JIT")
+def _cuda_arch_note():
+    """只做提示, 不作为失败判据 —— 缺 SASS 时可能靠 PTX JIT 正常跑。
+
+    真正的判据是上面那条 kernel 实测。这里只解释"能跑但会慢"的情形:
+    例如 sm_89 的卡跑只编译到 compute_37/compute_90 的 wheel, 会 JIT 编译,
+    首次算子有额外开销。
+    """
+    import torch
+    cap = torch.cuda.get_device_capability(0)
+    want = f"{cap[0]}{cap[1]}"
+    arch_list = list(torch.cuda.get_arch_list())
+    families = {a.replace("sm_", "").replace("a", "").replace("f", "") for a in arch_list}
+    if want in families:
+        return f"sm_{want} 直接命中编译目标"
+    return (f"（提示）sm_{want} 不在 [{(' / '.join(arch_list)) or '未知'}] 里。"
+            "这不必然是错误：缺 SASS 时可能靠 PTX JIT 跑起来（能跑但首次算子偏慢）。"
+            "**唯一判据是上一项的 kernel 实测**：它 PASS 就没事，它 FAIL 才是真的不可用。")
 
 
 @check("仓库为官方实现 + 失配相关源码在位")

@@ -61,9 +61,11 @@ $$[\boldsymbol a(\theta)]_m \leftarrow [\boldsymbol a(\theta)]_m + \mathcal{CN}(
 
 | 未明确项 | 本文建议 | 理由 |
 |---|---|---|
-| 失配实验训练时用多大的失配 | 场景一 $\eta_{train}=0.10$；场景二 $\sigma_{sv,train}^2=0.5$；并**补一组消融**（见 §8） | 论文只说"trained in a supervised manner with sufficient data **for a given array**"（Sec. III-E），没给具体失配值；取网格中偏上值作主模型，再用消融覆盖 |
+| 失配实验训练时用多大的失配 | **逐点匹配**（每个失配水平用它自己的失配训练一个模型，脚本默认 `--train_levels matched`），另补 `--train_levels single --train_at 0.0` 与 `--train_at 0.15` 两组消融（见 §8） | `IV-B-4` 完全没写训练协议；论文其它实验凡是"训练条件≠评估条件"都明说了（宽带、低 SNR），失配这一节什么都没说，故取"训练=评估"作为主口径；论文 Sec. III-E 只说 "trained in a supervised manner with sufficient data **for a given array**" |
 | 快拍数 T | 100 | 论文失配节未写；取充裕快拍以隔离失配这一单一变量（失配实验不考察 AS4） |
-| 训练样本量 | 10000（论文是 45000） | 显存/时间折中，见 §6；结论是定性趋势，样本量不敏感 |
+| 训练样本量 | 45000（脚本默认，与论文一致） | 论文 Sec. IV-A-3 原文 $J=45000$；显存/时间不够时再下调，见 §6 与 §16 |
+
+> ⚠️ **"逐点匹配"的代价**：4 个失配水平就是 4 个模型、4 份训练数据，训练时间是单模型的 4 倍。这是忠实复现 Fig. 9 的必要代价——用单一失配训练的模型去评估其它失配水平，衡量的是另一件事（那正是 §8 的消融 E3）。
 
 > ⚠️ **代码不支持"混合 M 训练"**：`src/system_model.py:43` 的 `SystemModelParams.M` 是**单个整数**（`set_parameter("M", 2)`），数据集与模型都绑定单一 M。因此论文那套"用所有 M 的混合数据预训练 + 每个 M 用 8000 样本适配"的流程**在本仓库里无法直接照搬**。
 > 好消息：失配实验固定 M=2，本来就是单 M 场景，**直接用一个 M=2 的数据集训练即可**，不构成阻塞。只是不要误以为可以复用 Table I 那套混合 M 的数据集。
@@ -232,26 +234,28 @@ system_model_params = (
 
 ---
 
-## 6. 服务器资源与耗时估算（基于本仓库已跑过的数据反推）
+## 6. 服务器资源与耗时估算
 
-本机已有实测基准：`10000` 样本、`T=200`、`tau=8` 生成耗时约 5 分钟，落盘 47 MB（`SubspaceNet_DataSet_*_10000_*.h5` = 47.41 MB）。
+**先看结论**：数据生成在自动相关张量向量化之后**已经不是瓶颈**（实测提速约 180 倍），真正的瓶颈是训练，而训练的热点又集中在 `root_music`（已批量向量化，见 §16）。所以排期时按"训练时间 × 失配水平数"估算即可。
+
+本机已有实测基准：`10000` 样本、`T=200`、`tau=8` 生成耗时约 5 分钟，落盘 47 MB（`SubspaceNet_DataSet_*_10000_*.h5` = 47.41 MB）。注意这是**向量化前**的数字。
 
 | 阶段 | 规模 | 磁盘 | 时间（参考） |
 |---|---|---|---|
-| 单个训练集生成 | 10000 样本, T=100 | ~24 MB | ~5–8 min |
-| 单个测试集生成 | 5000 样本, T=100 | ~12 MB + Generic ~30 MB | ~5 min |
-| 训练（单模型） | 10000 样本 × 80 epoch，batch 1024 | 权重 0.17 MB | GPU 上约 1–3 h（1080Ti 级别） |
+| 单个训练集生成 | 45000 样本, T=100 | ~105 MB | 向量化后约 1–3 min（取决于 CPU/IO） |
+| 单个测试集生成 | 5000 样本, T=100 | ~12 MB + Generic ~30 MB | 同上，约 1 min |
+| 训练（单模型） | 40500 训练样本 × 80 epoch，batch 1024 | 权重 0.17 MB | 见 §16 的吞吐实测换算 |
 | 评估（单失配水平） | 5000 样本 × (1 增强 + 2 基线) | — | ~2–5 min |
 
-**场景一总预算**（4 个失配水平）：数据 ~30 min + 训练 4 模型（若每水平都训练，约 4–12 h + 评估 20 min）
-**场景二总预算**：同上
+**场景一总预算**（4 个失配水平，逐点匹配）：数据 ~10 min + 训练 4 个模型 + 评估 20 min。
+**场景二总预算**：同上。
 
 **显存与 batch**（重要）：
 
 - 输入张量 $[B, \tau, 2N, N]$ 是主要占用：$B=2048,\tau=8,N=8$ 时 float32 约 16 MB，不是瓶颈
-- 真正吃显存的是对 $B$ 个 $8\times8$ 复矩阵做 `torch.linalg.eig` 并**反传**（`src/models.py:693` `root_music`）
-- **建议从 `batch_size=1024` 起测**；OOM 就降到 512/256。`main.py` 里默认的 2048 在大 GPU 上没问题，小显存上会炸
-- 训练集若用论文的 45000 样本：单个文件将达 ~210 MB，生成约 25 min，注意数据集目录预留 3–5 GB
+- 真正吃显存的是对 $B$ 个 $8\times8$ 复矩阵做 `torch.linalg.eig` 并**反传**（`src/models.py:744` `root_music`）
+- **建议从 `batch_size=1024` 起测**；OOM 就降到 512/256。实测 batch 1024 时峰值显存仅约 244 MiB（RTX 4060 Laptop 8 GiB），所以显存不是限制项
+- 训练集用论文的 45000 样本时，单个文件约 105 MB，数据集目录预留 1–2 GB
 
 ---
 
@@ -266,25 +270,28 @@ python reproduce_array_mismatch.py all --scenario spacing \
     --n_train 40 --n_test 20 --epochs 1 --batch_size 8 --limit 20
 
 # 1) 场景一：间距失配。默认 --train_levels matched，网格上每个 eta 各训一个模型
+#    （--n_train 默认已是 45000，与论文 Sec. IV-A-3 一致，这里显式写出以便看清）
 python reproduce_array_mismatch.py all --scenario spacing \
-    --n_train 10000 --n_test 5000 --epochs 80 --batch_size 1024 \
+    --n_train 45000 --n_test 5000 --epochs 80 --batch_size 1024 \
     --algorithms r-music esprit music
 
 # 2) 场景二：导向矢量加噪
 python reproduce_array_mismatch.py all --scenario sv_noise \
     --algorithms r-music esprit music
 
-# 3) 只要数据 / 只要训练 / 只要评估
-python reproduce_array_mismatch.py data  --scenario spacing
-python reproduce_array_mismatch.py eval  --scenario spacing --grid 0.025,0.05,0.1,0.15
+# 3) ⚠️ data / train / eval / all 四个模式跑的是**同一套流程**（同一处 run()），
+#    "只生成数据 / 只训练 / 只评估"只是历史命名。真正的"只评估"靠缓存命中：
+#    第二次跑同一条命令会跳过已存在的数据集与权重；唯一只读的模式是 plot（只出图）。
+python reproduce_array_mismatch.py all --scenario spacing   # 想继续上一次就跑同一条命令
+python reproduce_array_mismatch.py plot                     # 只读已有 JSON 出图
 
 # 4) 鲁棒性消融（E3）：只训一个模型，在整个网格上评估
 #    注意这与论文 Fig.9 的曲线口径不同，别混画
 python reproduce_array_mismatch.py all --scenario spacing \
     --train_levels single --train_at 0.0
 
-# 5) 先用少量样本试跑评估，确认无异常再放全量（避免 5000 样本跑到一半才发现问题）
-python reproduce_array_mismatch.py eval --scenario spacing --limit 200
+# 5) 评估侧先用少量样本试跑（--limit 只截断评估样本数，不影响生成与训练）
+python reproduce_array_mismatch.py all --scenario spacing --limit 200
 ```
 
 脚本参数一览：`--scenario spacing|sv_noise`、`--n_train`、`--n_test`、`--epochs`、`--batch_size`、
@@ -307,17 +314,18 @@ SUBSPACENET_DATA_ROOT=/data/subspacenet python reproduce_array_mismatch.py all -
 
 ### 7.1 上全量之前先跑环境自检
 
-同目录下的 `preflight_check.py` 用 **~1 分钟、只读、不留垃圾**的方式验证 12 项前置条件，
+同目录下的 `preflight_check.py` 用 **~1 分钟、只读、不留垃圾**的方式验证 14 项前置条件，
 任何 `[FAIL]` 都意味着全量跑（数小时）会失败或结论无效：
 
 ```bash
-python preflight_check.py          # 12 项静态+轻量检查
+python preflight_check.py          # 14 项静态+轻量检查
 python preflight_check.py --full   # 额外做一次真实训练冒烟（约 1 分钟）
 ```
 
 覆盖内容：Python/依赖版本、**CUDA 可用性**（`src/utils.py:32` 的 `device` 在 import 时定型，
-import 前就必须可见 CUDA）、关键文件在位、产物目录可写、**参数量 == 41761**、
-**RMSPE 缩放因子 == π/180**、**`nominal=True` 不再崩且 MUSIC 真能出数**、
+import 前就必须可见 CUDA）、**GPU 上真的能算**（跑一次复数 `matmul` + `linalg.eig` 并 `synchronize`，
+这是唯一能识破"装了不含本机 sm 的 wheel"的检查，详见 §15）、关键文件在位、产物目录可写、
+**参数量 == 41761**、**RMSPE 缩放因子 == π/180**、**`nominal=True` 不再崩且 MUSIC 真能出数**、
 `create_dataset` 的二元组结构与张量形状、**失配真的进入数据**、**各失配水平共享同一批 DoA**。
 退出码 0 = 全部通过。自检也顺手充当了"论文数字 vs 本仓库行为"的回归测试——
 如果你改了源码导致参数量或 RMSPE 口径变了，它会立刻报出来。
@@ -333,11 +341,13 @@ import 前就必须可见 CUDA）、关键文件在位、产物目录可写、**
 
 | 编号 | 场景 | 训练用失配 | 评估网格 | 回答的问题 |
 |---|---|---|---|---|
-| E1 | spacing | $\eta=0.10$ | 0.025/0.05/0.10/0.15 | 主结果，对齐 Fig. 9(a) |
-| E2 | sv_noise | $\sigma_{sv}^2=0.5$ | 0/0.25/0.5/0.75 | 主结果，对齐 Fig. 9(b) |
-| E3 | spacing | $\eta=0$（理想阵列） | 0.025/0.05/0.10/0.15 | **关键消融**：不做失配数据增强能否泛化？论文强调"learn from data to handle miscalibration"，E3 是其直接证据 |
-| E4 | spacing | $\eta=0.15$（最差情形） | 同上 | 训练在最坏情形的代价（轻度失配下是否反而变差） |
-| E5 | sv_noise | $\sigma_{sv}^2=0.75$ | 同上 | 同上 |
+| E1 | spacing | **逐点匹配**（每个水平各训一个，脚本默认 `--train_levels matched`） | 0.025/0.05/0.10/0.15 | 主结果，对齐 Fig. 9(a) |
+| E2 | sv_noise | **逐点匹配** | 0/0.25/0.5/0.75 | 主结果，对齐 Fig. 9(b) |
+| E3 | spacing | $\eta=0$（理想阵列），`--train_levels single --train_at 0.0` | 0.025/0.05/0.10/0.15 | **关键消融**：不做失配数据增强能否泛化？论文强调"learn from data to handle miscalibration"，E3 是其直接证据 |
+| E4 | spacing | $\eta=0.15$（最差情形），`--train_at 0.15` | 同上 | 训练在最坏情形的代价（轻度失配下是否反而变差） |
+| E5 | sv_noise | $\sigma_{sv}^2=0.75$，`--train_at 0.75` | 同上 | 同上 |
+
+> E3–E5 都属于 `--train_levels single`，衡量的是"用**一个**失配水平训练的模型能否泛化到整个网格"，与 E1/E2 的口径**不同**，报告里必须分开画、并标注 `matched=false`（结果 JSON 的每行都带这个字段）。
 
 另外三个**低成本必做项**：
 
@@ -350,10 +360,12 @@ import 前就必须可见 CUDA）、关键文件在位、产物目录可写、**
    | conv1 | $\tau=8$ | $(8\cdot4+1)\times16 = 528$ |
    | conv2 | $16\times2=32$（AReLU 翻倍） | $(32\cdot4+1)\times32 = 4128$ |
    | conv3 | $32\times2=64$ | $(64\cdot4+1)\times64 = 16448$ |
-   | deconv1 | 64 | $(64\cdot4+1)\times32 = 16416$ |
-   | deconv2 | $32\times2=64$ | $(64\cdot4+1)\times16 = 4112$ |
-   | deconv3 | $16\times2=32$ | $(32\cdot4+1)\times1 = 129$ |
+   | deconv2 | 64 | $(64\cdot4+1)\times32 = 16416$ |
+   | deconv3 | $32\times2=64$ | $(64\cdot4+1)\times16 = 4112$ |
+   | deconv4 | $16\times2=32$ | $(32\cdot4+1)\times1 = 129$ |
    | **合计** | | **41761** ✅ |
+
+   > 层名以代码为准（`src/models.py:296-301`）：SubspaceNet 用的是 `conv1/conv2/conv3` + `deconv2/deconv3/deconv4`，**没有 `deconv1`**（论文正文说的"3 层 DCNN"对应代码里的 deconv2/3/4）。注意别和同文件里另一个模型 `DeepRootMUSIC`（`src/models.py:196-201`，有 `deconv1`、且 `conv2` 是 `Conv2d(16,32,2)`）混淆，两者行号相邻但层定义不同。
 
    **手算结果与论文的 41,761 完全一致**（已核对）。这条自检很有价值，因为它一次性验证了三件事：
    ① 通道数 16/32/64 → 32/16/1 与 2×2 核的描述正确；② AReLU 的通道翻倍语义正确；③ **$\tau=8$ 确实是论文所用的滞后阶数**。
@@ -432,9 +444,9 @@ scp -r user@server:/home/user/SubspaceNet/data/simulations/results/array_mismatc
 
 ---
 
-## 10.5 关于"Appendix"：这篇论文没有 Appendix，但 Sec. IV-C 是必读的
+### 10.5 关于"Appendix"：这篇论文没有 Appendix，但 Sec. IV-C 是必读的
 
-### 10.5.1 先澄清一件事
+#### 10.5.1 先澄清一件事
 
 **2025 年的 IEEE TSP 版本没有 Appendix**。我核对了从 PDF 提取的全文，章节结构是：
 
@@ -451,7 +463,7 @@ REFERENCES                            ← 直接结束，无附录
 
 即所有超参数（$\mu=0.001$、$\epsilon=1$、41761 参数、45,000 样本等）都写在 **Sec. IV-A-2** 正文里，没有一个"Appendix 补充材料"可以查。如果你手头某个版本提到 Appendix，那多半是 arXiv 早期版本或会议版的编号差异——**复现时以本文档 §1/§5 汇总的 Sec. IV-A-2 数值为准**。
 
-### 10.5.2 真正应该替代"找 Appendix"去读的：Sec. IV-C Interpretability
+#### 10.5.2 真正应该替代"找 Appendix"去读的：Sec. IV-C Interpretability
 
 失配实验只给了 RMSPE 曲线，而**RMSPE 曲线本身无法证明 SubspaceNet 学到了正确的子空间**——它可能只是过拟合出一个"碰巧算出接近角度"的矩阵。Sec. IV-C 提供的正是这个**内部正确性判据**，强烈建议复现时一并做，成本很低：
 
@@ -470,7 +482,7 @@ REFERENCES                            ← 直接结束，无附录
 > 说明一下这些点的正确用法：它们是**相干源**场景（违反 AS2），不是失配场景。所以**不要**拿它们当失配实验的数据点；正确的用法是——在你的失配模型训练好之后，把它们喂进去当"体检"：
 > **如果 SubspaceNet+Root-MUSIC 在这些相干源上仍能把非 DoA 根推离单位圆，说明模型学到的是真正的子空间结构；如果谱完全混乱，那即使 §7 的 RMSPE 曲线"看起来像 Fig. 9"，也应视为复现失败。**
 
-### 10.5.3 与本仓库的对应关系
+#### 10.5.3 与本仓库的对应关系
 
 - 特征值分离：`SubspaceMethod.calculate_covariance(X, mode, model)` 已支持三种协方差来源（`sample` / `spatial_smoothing` / `SubspaceNet`，见 `src/methods.py`），**同一份数据可以一次算出三者对比**，这就是 Fig. 10 的现成实现路径
 - MUSIC 谱：`src/methods.py:246` 的 18000 点网格本来就会返回整条谱（Root-MUSIC 则返回 `roots` 与 `roots_angels_all` 两个中间量），画谱不需要额外改动
@@ -628,7 +640,7 @@ return predictions, response_curve     # src/methods.py:657-658
 
 四个失配水平上 `fail_rate` 全为 **0.0**（Root-MUSIC 每次都取到 M 个根），说明这些数字不是"补随机猜测"造成的地板值。
 
-**怎么读这张表**：它证明的是**链路通**，不是复现成功。经典基线随 η 单调劣化（4.07° → 26.48°）正是论文描述的物理趋势；而 SubspaceNet 在这里反而更差，纯粹因为这是 40 样本 / 1 epoch 的冒烟配置——模型根本没学到东西。**不要把这个结果当作复现结论**，正式跑必须回到 `--n_train 10000 --epochs 80` 起步。
+**怎么读这张表**：它证明的是**链路通**，不是复现成功。经典基线随 η 单调劣化（4.07° → 26.48°）正是论文描述的物理趋势；而 SubspaceNet 在这里反而更差，纯粹因为这是 40 样本 / 1 epoch 的冒烟配置——模型根本没学到东西。**不要把这个结果当作复现结论**，正式跑必须回到 `--n_train 45000 --epochs 80` 起步。
 
 顺带确认了三件实现细节：`SubspaceNet.forward(batch=1)` 输出 `Rz` 形状 `(1, 8, 8)`、`dtype=torch.complex64`；三种算法的返回元数分别为 RootMUSIC=5、Esprit=2、MUSIC=3（`MUSIC.narrowband` 返回 `(predictions, spectrum, M)`）；`_deg` 与 `_ref` 两列的比值在每行都是 57.2958（例：η=0.15 的 r-music：`0.4622 × 57.2958 = 26.48`），再次印证 §3 的口径结论。
 
@@ -716,5 +728,220 @@ python reproduce_array_mismatch.py all --scenario spacing \
 ```
 
 exit 0，产出 14 张 PNG（4 个失配水平 × 3 类体检图 + 2 张曲线图），且各水平的 `*_deg` 数值与 §13.5 表完全一致——说明加图**没有改动数值链路**。
+
+---
+
+## 15. 服务器 GPU 是 Blackwell（sm_120）时的 torch 版本问题
+
+### 15.1 症状与根因
+
+在 RTX PRO 6000 Blackwell（compute capability 12.0）服务器上跑 `preflight_check.py`，会看到这样的组合：
+
+```
+  [PASS] CUDA 可用
+           NVIDIA RTX PRO 6000 Blackwell Server Edition, 95.0 GiB, compute capability (12, 0)
+  [FAIL] MUSIC.narrowband 能真正出数（不只是不崩）
+           RuntimeError: CUDA error: no kernel image is available for execution on the device
+```
+
+同时前面还有一条容易被划过去的警告：
+
+```
+NVIDIA RTX PRO 6000 Blackwell Server Edition with CUDA capability sm_120 is not compatible
+with the current PyTorch installation.
+The current PyTorch install supports CUDA capabilities sm_37 sm_50 sm_60 sm_70 sm_75 sm_80 sm_86.
+```
+
+**根因**：仓库 `pyEnv/requirements.txt:23` 锁的是 `torch==2.0.1`。这个版本的官方 wheel **只编译到 sm_86**（`torch.cuda.get_arch_list()` 里最高是 `sm_86`/`compute_37`），而 Blackwell 是 **sm_120**。wheel 里没有 sm_120 的 SASS，且 CUDA 12.8 起已不再为 sm_120 做老 PTX 的 JIT 兼容，于是**任何真实计算**都抛 `no kernel image is available`。
+
+**为什么前面 6 项还能 PASS**：`torch.cuda.is_available()` 只问"驱动看得见卡吗"，**它不检查这个构建里有没有对应架构的 kernel**。所以 `is_available()` 返回 `True`、`get_device_name()` 也能拿到名字，但第一次真正算东西就炸。
+
+**为什么错误看起来"位置随机"**：CUDA 的 kernel 错误是**异步**上报的。真正失败的可能是好几行之前的某个算子，直到某次同步才抛出来。所以你在 `[3]` MUSIC 那里看到的报错，不代表 MUSIC 有问题——**它只是第一个触发同步的地方**。
+
+> 实测旁证：这条报错本身与环境无关。本机 RTX 4060 Laptop（sm_89）跑 `torch 2.0.1+cu118`（同样没有 sm_89 SASS）却一切正常，因为它能靠 wheel 里的 **PTX JIT** 回退编译。Blackwell 上这条回退路径断了，于是暴露出来。这也说明"能不能跑"必须实测，不能只看 arch 列表。
+
+### 15.2 解决：换装带 sm_120 的 torch（PyTorch ≥ 2.7 的 cu128 wheel）
+
+Blackwell 支持从 **PyTorch 2.7** 起进入官方稳定 wheel（cu128 构建）。推荐 **2.7.x / 2.8.x**（不要用太新的版本，见 §15.5 的兼容性提醒）。
+
+**先确认驱动够新**（cu128 wheel 需要驱动支持 CUDA 12.8，即 Linux ≥ 570）：
+
+```bash
+nvidia-smi        # 看右上角 "CUDA Version: 12.x"，>= 12.8 即可
+```
+
+**方案 A（推荐，不改动现有环境，风险最低）**——新建一个环境：
+
+```bash
+conda create -n subn_sm120 python=3.10 -y
+conda activate subn_sm120
+
+# 1) torch 和它的 CUDA 运行时一起装（会自动带 nvidia-* 依赖，别单独装 cu117 那套）
+pip install torch==2.7.0 --index-url https://download.pytorch.org/whl/cu128
+
+# 2) 其余依赖（注意 requirements.txt 里锁了 torch==2.0.1，**不要直接 pip install -r**，
+#    否则会把刚装好的 torch 降级回去）
+pip install numpy==1.24.3 scipy==1.10.1 matplotlib==3.7.1 scikit-learn==1.2.2 \
+            tqdm==4.65.0 h5py pandas seaborn
+```
+
+**方案 B（就地升级，省空间，但要先记录当前版本以便回滚）**：
+
+```bash
+conda activate SubspaceNet_original
+pip freeze > ~/pip_freeze_before_sm120.txt          # ★回滚依据，务必先做
+pip install --upgrade torch==2.7.0 --index-url https://download.pytorch.org/whl/cu128
+```
+
+> 若 pip 因为"已安装 torch 2.0.1"而不肯换，用
+> `pip install --force-reinstall --no-deps torch==2.7.0 --index-url https://download.pytorch.org/whl/cu128`
+> 再补齐 `nvidia-*` 依赖（它们会随 torch 一起装，`--no-deps` 会漏掉，所以更推荐不加 `--no-deps`）。
+
+**方案 C（内网/无法直连 pypi 的场景）**：在能联网的机器上
+`pip download torch==2.7.0 --index-url https://download.pytorch.org/whl/cu128 -d ./wheels`
+（大约 800 MB~1 GB，含 `nvidia-*` 依赖），scp 上去后 `pip install --no-index --find-links ./wheels torch==2.7.0`。
+
+**不要尝试的三条路**（都会浪费时间）：
+
+1. 在服务器上装 `cudatoolkit=11.7/11.8`——问题不在 CUDA 工具链，在 wheel 里缺 sm_120 kernel；
+2. 用 `CUDA_LAUNCH_BLOCKING=1` 让它"跑起来"——它只是让报错同步，不产生缺失的 kernel；
+3. 改 `src/utils.py:32` 强制 CPU——全量 10000 样本 / 80 epoch 在 CPU 上是不可接受的。
+
+### 15.3 验证（换完必须做，两条命令）
+
+```bash
+# ① 一行确认 kernel 真的能跑（关键是 synchronize，否则错误会异步溜走）
+python -c "import torch; d='cuda'; a=torch.randn(64,64,dtype=torch.complex64,device=d); \
+b=torch.randn(64,64,dtype=torch.complex64,device=d); (a@b).sum().real.item(); \
+torch.linalg.eig(a+a.conj().T); torch.cuda.synchronize(); \
+print(torch.__version__, torch.cuda.get_device_name(0), torch.cuda.get_arch_list())"
+
+# ② 跑完整自检（这一步会真的训 2 个 epoch，是最终判据）
+python preflight_check.py --full
+```
+
+`①` 应当打印出 `2.7.0+cu128` 和一张含 `sm_120` 的 arch 列表；`②` 应当 `FAIL=0` 且 exit 0。
+**只要 `②` 里有任何一项 FAIL，就先别上全量**——正式跑是几小时，自检是 1 分钟。
+
+### 15.4 preflight_check.py 已增强（本机 v2）
+
+原先的自检漏掉了这个问题（它只查 `is_available()`），现在 `[1] 依赖与 CUDA` 里改成三项、并且**第一个真正的 kernel 测试放在最前面**：
+
+| 项 | 判据 | 失败时会说什么 |
+|---|---|---|
+| `cuda.is_available()` | 驱动能看见卡 | 提示 `src/utils.py:32` 的 `device` 在 import 时定型 |
+| **`GPU 上真的能算（复数 matmul + linalg.eig，带同步）`** | **跑真实 kernel + `torch.cuda.synchronize()`** | 直接说出"本机是 sm_xxx，这个构建只编译了 [...]，请换 cu128 wheel"，并指向本节 |
+| `（提示）GPU 架构是否在 torch 编译目标里` | 仅提示，不算失败 | 说明"缺 SASS 可能靠 PTX JIT 跑起来"，并指明唯一判据是上一项 |
+
+这么改的用意：把这类错误**从"跑到第 3 项才炸、且报错位置随机"提前到第 1 组、并且直接给出结论**。第 1 组还会先做复数 `matmul` 与 `linalg.eig`——这正是 SubspaceNet 推理最依赖、也最容易撞 sm 问题的两个算子。
+
+### 15.5 换 torch 版本的兼容性提醒（本项目特有）
+
+torch 从 2.0.1 跳到 2.7/2.8 跨了 7 个 minor，跑之前留意这几点：
+
+- **`torch.load` 的默认值变了**：torch 2.6 起 `weights_only` 默认为 `True`。仓库用 `state_dict` 级别的保存/加载不需要改；但如果你自己 `torch.save` 过**自定义对象**（不是 `state_dict`），加载会报 `UnpicklingError`，那时显式传 `weights_only=False`。
+- **`root_music(Rz, M, batch_size)` 是显存/算力热点**（`src/models.py:744`，其两个批量辅助函数在 `src/models.py:693` 与 `src/models.py:720`）：它对 batch 内每个 8×8 复矩阵做 `torch.linalg.eig` 并反传。换版本后如果遇到 `linalg.eig` 的 backward 报错或变慢，先确认 `--batch_size` 不是罪魁；论文设置里评估是逐样本（batch=1），训练时才用大 batch。该函数已做批量向量化，详见 §16。
+- **复现口径不受影响**：参数量 41761、RMSPE 的 π/180 缩放、`nominal=True` 补丁、`bias=0` 这些都与 torch 版本无关。`preflight_check.py` 里的第 [2][3] 组会在换版本后**重新替你验一遍**，所以"换了 torch 会不会偏离论文"这个问题不用自己推理——跑一次自检即可。
+- **不要顺手升 numpy/python**：仓库锁 `numpy==1.24.3`，脚本里 `as_pred_array()` 就是为了兼容 numpy 1.x 对 `None` 的静默行为（见 §13.4）。换 torch 时保持其余版本不动，能把变量控制到最少。
+
+---
+
+## 16. 训练速度：热点定位与已做的两处改动
+
+这一节只讲**性能**，不改任何复现口径。如果你觉得训练太慢（例如一个 epoch 要几十分钟），先读这里再动手。
+
+### 16.1 热点在 `root_music`，占了前向的 90% 以上
+
+把 `SubspaceNet.forward` 拆成三段实测（T=100、N=8、τ=8，RTX 4060 Laptop）：
+
+| batch | backbone | gram | `root_music` | `root_music` 占比 |
+|---|---|---|---|---|
+| 1 | 0.81 ms | 0.16 ms | 2.71 ms | 73.6% |
+| 32 | 0.77 ms | 3.81 ms | 43.6 ms | 90.5% |
+| 1024 | 5.28 ms | 123.9 ms | 1565.7 ms | **92.4%** |
+
+**CNN 主干只占 0.3%**——所以换更大网络、调 batch、加 `num_workers` 都不会有实质改善，唯一的杠杆是 `root_music` 自己。
+
+原因：`root_music` 原本是**逐样本的 Python 循环**（`for iter in range(batch_size)`），每个样本都独立启动一整套 kernel（EVD → argsort → gather → 矩阵乘 → 15 次对角线求和 → 多项式求根 → 排序取根）。batch=1024 就是 1024 轮。单样本的算子合计只有 0.889 ms，而整段实测 1.44 ms/sample——**多出来的 0.55 ms 全是解释器与 kernel 启动开销**。
+
+### 16.2 顺带发现的 device 陷阱：多项式求根被静默丢到 CPU
+
+`src/utils.py:147` 的 `find_roots_torch`：
+
+```python
+A = torch.diag(torch.ones(len(coefficients) - 2, dtype=coefficients.dtype), -1)   # ← 没给 device
+```
+
+伴随矩阵建在 CPU 上。往这个 CPU 矩阵里赋值 CUDA 张量时 PyTorch **不报错、而是静默拷回 CPU**，于是 `torch.linalg.eigvals` 每个样本都在 CPU 上跑一次，并返回 CPU 张量——**每个样本一次 GPU↔CPU 往返**。
+
+这里有个反直觉的结论，我实测过：
+
+| batch | 原样（求根落 CPU） | 只把 device 补上（求根上 GPU） |
+|---|---|---|
+| 256 | 1255 ms/step | **2072 ms/step**（更慢） |
+| 1024 | 5177 ms/step | **8475 ms/step**（更慢） |
+
+因为 14×14 矩阵的 `eigvals` 在 CPU 上本来就快，搬到 GPU 反而多了 kernel 启动与每步同步。**所以千万不要单独给那一行加 `.to(device)`**——那会让训练更慢。正确做法是连同循环一起批量化（下面），批量化之后求根需要多快有多快（一次算 256 个样本的 8×8 特征分解只要 0.369 ms）。
+
+这个陷阱也是"服务器比我本机还慢"的原因：本机 GPU 慢，CPU 往返被计算掩住了；高端卡上 GPU 早早算完，只能干等 CPU 往返，比例反而放大。
+
+### 16.3 改动一：`root_music` 批量向量化（`src/models.py:693-806`）
+
+三个函数：
+
+| 函数 | 位置 | 作用 |
+|---|---|---|
+| `sum_of_diags_batched(matrix)` | `src/models.py:693` | `(B,N,N) → (B,2N-1)`，一次算完所有对角线（原版是 15 次独立 kernel） |
+| `find_roots_batched(coefficients)` | `src/models.py:720` | `(B,L) → (B,L-1)`，伴随矩阵**显式建在系数所在设备**上 |
+| `root_music(Rz, M, batch_size)` | `src/models.py:744` | 一次 batched EVD + gather + 噪声子空间投影；只有最后的"取 M 个根"仍是逐样本**切片**（不涉及算子） |
+
+**为什么结果不变**：`F = U_n U_n^H` 对 `U_n` 的每一列尺度不变，所以批量 EVD 与逐样本 EVD 在特征向量归一化上的差异不影响 `F`；列顺序由 `argsort` 保证一致。返回值三元组的语义也保持一致（第三个仍是"最后一个样本的根"，与原实现的既有行为相同）。
+
+### 16.4 改动二：验证集 DataLoader 的 batch（`src/training.py:284-286`）
+
+原代码把验证集 batch 写死为 1，4500 个验证样本就是 4500 次逐样本前向。改为 `batch_size=self.batch_size`。**数值不变**：`src/evaluation.py:117-118` 是 `overall_loss += eval_loss.item()` 再除以按样本数累加的 `test_length`，与 batch 无关。
+`reproduce_array_mismatch.py:672-675` 里也有同样的一处（脚本会覆盖 `tparams.valid_dataset`），已一并改为 `BATCH_SIZE`。
+
+### 16.5 实测提速（RTX 4060 Laptop，T=100/N=8/τ=8）
+
+| batch | 原始 ms | 批量 ms | 加速 | samples/s |
+|---|---|---|---|---|
+| 8 | 11.5 | 2.9 | 4.0× | 693 → 2739 |
+| 32 | 41.4 | 7.4 | 5.6× | 774 → 4318 |
+| 256 | 337.3 | 54.2 | 6.2× | 759 → 4726 |
+| 1024 | 1485.1 | 223.0 | 6.7× | 690 → 4592 |
+
+整步训练（forward + RMSPELoss + backward + Adam）：
+
+| batch | 原始 | 批量 |
+|---|---|---|
+| 256 | 1255 ms/step（204 samples/s） | **497 ms/step（516 samples/s）** |
+| 1024 | 5177 ms/step（198 samples/s） | **1900 ms/step（539 samples/s）** |
+
+峰值显存不变（batch 256 时 75 MiB、batch 1024 时 244 MiB）。换算到论文规模（40500 训练 + 4500 验证）：**每 epoch 约 4.4 分钟 → 约 1.5 分钟**；80 epoch 单模型约 6 h → 约 2 h。
+
+### 16.6 怎么验证它没改坏数值
+
+仓库根目录的 `verify_root_music_batch.py` 内联保留了改写前的**逐样本原始实现**，在同一批输入上逐项对比：
+
+```bash
+python verify_root_music_batch.py           # 等价性 + 提速
+python verify_root_music_batch.py --quick   # 只做等价性
+```
+
+它检查三件事并给出退出码（0 = 通过）：
+
+- **前向**：M 个 doa 逐样本一致、全部根的 doa **集合**一致（容差 1e-4 rad）。实测最大偏差 **1.6e-6 rad**。
+  （只比较集合是因为 `doa_all_batches` 由全部 2N-2 个根导出，批量 EVD 与逐样本 EVD 的**根排列**可能不同；它只被 `src/evaluation.py:121-129` 的 `plot_spec=True` 分支用于画谱图，不进入任何指标。）
+- **反向**：对 `Rz` 的梯度相对偏差（容差 1e-2）。实测 **1.3e-5**。
+- **提速**：上面两张表。
+
+改动梯度路径意味着**最终 RMSPE 会有微小偏移**，所以换用这个版本后请重跑一次 `--smoke --force_data`，对照 §13.5 的表确认量级没变（η=0.025 时 SubNet+r-music ≈ 25.28°、r-music ≈ 4.07°）。已生成的数据集与权重格式不变，可以继续复用。
+
+### 16.7 还没做的项（按性价比排序）
+
+1. **`esprit` 分支**（`src/models.py:813`）是同样的逐样本循环。论文主结果用的是 `root_music`，所以没动它；若你要用 `--diff_method esprit` 训练，需要同样处理。
+2. 两个评估用 DataLoader 加 `num_workers=4, pin_memory=True`（`reproduce_array_mismatch.py:710-711`）。
+3. `src/training.py:437` 每个 best epoch 都会 `copy.deepcopy(model.state_dict())`；改成存盘 + 结束回读可省一份拷贝峰值。
 
 
