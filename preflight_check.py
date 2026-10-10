@@ -453,6 +453,44 @@ def _rmspe_loss_equivalence():
     return f"M=2/3、batch 1/8/128 上 loss 差 {worst_loss:.3e}、梯度相对差 {worst_grad:.3e}"
 
 
+@check("判据函数跟随预测张量的设备（换卡跑时不会 cuda:0/cuda:1 冲突）")
+def _loss_device_following():
+    """RMSPELoss / MSPELoss 必须跟着传进来的预测走，而不是跟着导入期常量（文档 §16.15）。
+
+    回归对象：`python bench_step_split.py --device 1` 在算 loss 时抛
+    "Expected all tensors to be on the same device, but found at least two devices,
+    cuda:0 and cuda:1!" —— 根因是 src/criterions.py 顶部那个导入期常量。本机只有一张卡，
+    所以把该常量**故意指到 cpu**，制造同一类错配。
+    """
+    import numpy as np
+    import torch
+
+    import src.criterions as criterions
+    from src.criterions import MSPELoss, RMSPELoss
+
+    original = criterions.device
+    worst = 0.0
+    try:
+        for name, criterion in (("RMSPELoss", RMSPELoss()), ("MSPELoss", MSPELoss())):
+            predictions = torch.rand(32, 2, device=original) * np.pi - np.pi / 2
+            targets = torch.rand(32, 2, device=original) * np.pi - np.pi / 2
+
+            expected = criterion(predictions.clone(), targets).item()
+            criterions.device = torch.device("cpu")     # 故意指错
+            got = criterion(predictions.clone(), targets).item()
+            criterions.device = original
+
+            diff = abs(got - expected)
+            worst = max(worst, diff)
+            assert diff < 1e-6, (
+                f"{name} 在模块常量指错后给出的 loss 变了 {diff:.3e}，说明它仍在用导入期常量。"
+                f"换卡运行时会在训练中途抛 device 不匹配。"
+            )
+    finally:
+        criterions.device = original
+    return f"模块常量故意指错后 RMSPELoss/MSPELoss 的 loss 差 {worst:.3e}"
+
+
 @check("esprit 的批量实现与逐样本原始实现等价（仅 esprit 分支）")
 def _esprit_equivalence():
     """src/models.py 的 esprit 原本是逐样本循环（文档 §16.9）。

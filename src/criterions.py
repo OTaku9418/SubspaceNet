@@ -84,6 +84,28 @@ def permute_prediction(prediction: torch.Tensor):
     predictions = torch.stack(torch_perm_list, dim = 0)
     return predictions
 
+def trainable_device(module, reference: torch.Tensor) -> torch.device:
+    """Device to put criterion temporaries on: wherever the predictions already live.
+
+    The module-level ``device`` below is fixed at import time (``cuda:0`` whenever any GPU is
+    visible), so any script that runs on a different card -- ``CUDA_VISIBLE_DEVICES``, or the
+    ``--device`` flag of the benchmark scripts, which patch ``src.utils.device`` after import --
+    would otherwise move predictions to ``cuda:0`` and then compare them against a target that
+    is still on ``cuda:1``::
+
+        RuntimeError: Expected all tensors to be on the same device, but found at least two
+        devices, cuda:0 and cuda:1!
+
+    Instead of trusting the import-time constant, follow the tensor that is handed in. The
+    chosen device is cached on the module purely to avoid re-deciding it on every call.
+    """
+    cached = getattr(module, "_followed_device", None)
+    if cached is not None and cached == reference.device:
+        return cached
+    module._followed_device = reference.device
+    return reference.device
+
+
 class RMSPELoss(nn.Module):
     """Root Mean Square Periodic Error (RMSPE) loss function.
     This loss function calculates the RMSPE between the predicted values and the target values.
@@ -139,10 +161,11 @@ class RMSPELoss(nn.Module):
             over the batch; the arithmetic is unchanged, so the returned loss and the gradient are
             bit-identical to the loop (see ``bench_step_split.py`` and the repository notes).
         """
-        # [B, M!] RMSPE of every permutation of every sample: all permutations at once, then the
-        # same modulo-pi wrap-up the loop applied one prediction at a time.
-        prediction_perm = permute_prediction_batched(doa_predictions).to(device)  # [B, M!, M]
-        error = (((prediction_perm - doa.unsqueeze(1)) + (np.pi / 2)) % np.pi) - np.pi / 2
+        # Follow the predictions rather than the import-time `cuda:0` constant, so that running
+        # on a non-default card does not mix devices (see trainable_device above).
+        target_device = trainable_device(self, doa_predictions)
+        prediction_perm = permute_prediction_batched(doa_predictions).to(target_device)  # [B, M!, M]
+        error = (((prediction_perm - doa.to(target_device).unsqueeze(1)) + (np.pi / 2)) % np.pi) - np.pi / 2
         rmspe_val = (1 / np.sqrt(doa.shape[-1])) * torch.linalg.norm(error, dim=-1)  # [B, M!]
         # Minimal error over all permutations, per sample, then the sum over the batch.
         return torch.min(rmspe_val, dim=1).values.sum()
@@ -196,8 +219,9 @@ class MSPELoss(nn.Module):
             Batched re-implementation of the original per-sample loop; see the note on
             :meth:`RMSPELoss.forward`. Same arithmetic, so the loss and gradient are unchanged.
         """
-        prediction_perm = permute_prediction_batched(doa_predictions).to(device)  # [B, M!, M]
-        error = (((prediction_perm - doa.unsqueeze(1)) + (np.pi / 2)) % np.pi) - np.pi / 2
+        target_device = trainable_device(self, doa_predictions)
+        prediction_perm = permute_prediction_batched(doa_predictions).to(target_device)  # [B, M!, M]
+        error = (((prediction_perm - doa.to(target_device).unsqueeze(1)) + (np.pi / 2)) % np.pi) - np.pi / 2
         rmspe_val = (1 / doa.shape[-1]) * (torch.linalg.norm(error, dim=-1) ** 2)  # [B, M!]
         return torch.min(rmspe_val, dim=1).values.sum()
 

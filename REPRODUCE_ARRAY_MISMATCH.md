@@ -314,12 +314,12 @@ SUBSPACENET_DATA_ROOT=/data/subspacenet python reproduce_array_mismatch.py all -
 
 ### 7.1 上全量之前先跑环境自检
 
-同目录下的 `preflight_check.py` 用 **~1 分钟、只读、不留垃圾**的方式验证 17 项前置条件，
+同目录下的 `preflight_check.py` 用 **~1 分钟、只读、不留垃圾**的方式验证 21 项前置条件，
 任何 `[FAIL]` 都意味着全量跑（数小时）会失败或结论无效：
 
 ```bash
-python preflight_check.py          # 17 项静态+轻量检查
-python preflight_check.py --full   # 额外做一次真实训练冒烟（约 1 分钟）
+python preflight_check.py          # 20 项静态+轻量检查（跳过真实训练冒烟）
+python preflight_check.py --full   # 21 项，额外做一次真实训练冒烟（约 1 分钟）
 ```
 
 覆盖内容：Python/依赖版本、**CUDA 可用性**（`src/utils.py:32` 的 `device` 在 import 时定型，
@@ -327,7 +327,8 @@ import 前就必须可见 CUDA）、**GPU 上真的能算**（跑一次复数 `m
 这是唯一能识破"装了不含本机 sm 的 wheel"的检查，详见 §15）、关键文件在位、产物目录可写、
 **参数量 == 41761**、**RMSPE 缩放因子 == π/180**、**`nominal=True` 不再崩且 MUSIC 真能出数**、
 `create_dataset` 的二元组结构与张量形状、**失配真的进入数据**、**各失配水平共享同一批 DoA**、
-**`root_music` 的批量实现与逐样本原始实现等价**（回归保护，见 §16.6）。
+**`root_music` / `gram_diagonal_overload` / `esprit` / `RMSPELoss` 的批量实现与逐样本原始实现等价**、
+**判据函数跟随预测张量的设备**（换卡跑不会 cuda:0/cuda:1 冲突，见 §16.15）。
 退出码 0 = 全部通过。自检也顺手充当了"论文数字 vs 本仓库行为"的回归测试——
 如果你改了源码导致参数量或 RMSPE 口径变了，它会立刻报出来。
 
@@ -517,8 +518,8 @@ REFERENCES                            ← 直接结束，无附录
 **环境自检（1–2 分钟，建议正式跑之前先过一遍）**
 
 - [ ] 用极小数据跑通一次并得到四行结果：`--n_train 40 --n_test 20 --epochs 1 --batch_size 8 --limit 20`（§13.5 有预期形状）
-- [ ] `python preflight_check.py` 全绿（13 项：依赖/CUDA/参数量/RMSPE 口径/nominal 导向矢量/MUSIC 出数/数据管线/失配注入/DoA 可比性）
-- [ ] 需要连训练路径一起验时加 `--full`（约 1 分钟）
+- [ ] `python preflight_check.py` 全绿（20 项：依赖/CUDA 真算一次/参数量 41761/RMSPE 口径 π/180/nominal 导向矢量/MUSIC 出数/数据管线/失配注入/DoA 可比性/四处批量实现的等价性/判据函数的设备跟随）
+- [ ] 需要连训练路径一起验时加 `--full`（21 项，约 1 分钟）
 
 **出图（PNG，见 §14）**
 
@@ -655,7 +656,7 @@ return predictions, response_curve     # src/methods.py:657-658
 - `--capture` 存 `params` 时若直接 `np.savez(dict)`，读回会撞 `ValueError: Object arrays cannot be loaded when allow_pickle=False`。**注意 `np.load` 是惰性的**——错误要到你真正取那个数组时才抛，所以 `try/except` 包住 `np.load` 本身没用，必须把数组全部取出来。现在存的是 JSON 字符串，并且 `_load_capture` 会为旧 npz 回退到 `allow_pickle=True`。
 - `RootMUSIC.narrowband` 返回的 `roots`（`src/methods.py:475-486`）是**全部 N 个根**（按到单位圆的距离排序），而 `doa_predictions` 只取单位圆内的前 M 个（`roots_inside = [root for root in roots if ((abs(root)-1) < 0)][:M]`）。画根图若按 `roots[:len(predictions)]` 取，会拿到半径 >1 的根。
 
-> 自检小抄：`python preflight_check.py` 全绿（13 项，见 §7.1），或 `python reproduce_array_mismatch.py all --scenario spacing --n_train 40 --n_test 20 --epochs 1 --batch_size 8 --limit 20` 能在 1–2 分钟内跑出上面这种形状的四行输出，说明**环境、依赖、CUDA、数据管线、三算法、指标口径**全部就绪，可以放心上全量了。
+> 自检小抄：`python preflight_check.py` 全绿（20 项，见 §7.1），或 `python reproduce_array_mismatch.py all --scenario spacing --n_train 40 --n_test 20 --epochs 1 --batch_size 8 --limit 20` 能在 1–2 分钟内跑出上面这种形状的四行输出，说明**环境、依赖、CUDA、数据管线、三算法、指标口径**全部就绪，可以放心上全量了。
 
 ---
 
@@ -835,6 +836,8 @@ python preflight_check.py --full
 | `（提示）GPU 架构是否在 torch 编译目标里` | 仅提示，不算失败 | 说明"缺 SASS 可能靠 PTX JIT 跑起来"，并指明唯一判据是上一项 |
 
 这么改的用意：把这类错误**从"跑到第 3 项才炸、且报错位置随机"提前到第 1 组、并且直接给出结论**。第 1 组还会先做复数 `matmul` 与 `linalg.eig`——这正是 SubspaceNet 推理最依赖、也最容易撞 sm 问题的两个算子。
+
+（自检本身也在长：最近几轮陆续加了四处批量实现的等价性回归、以及判据函数的设备跟随检查，现在 `--full` 是 **21 项 / 0 FAIL**，见 §7.1。）
 
 ### 15.5 换 torch 版本的兼容性提醒（本项目特有）
 
@@ -1077,61 +1080,6 @@ doa_batches = -1 * torch.arcsin((1 / np.pi) * torch.angle(phi_eigenvalues))
 4. **反向传播**：`RMSPELoss` 那部分已由 §16.13 解决。剩下的反向主要是 `SliceBackward0` / `DiagonalBackward0` 这类按根逐样本展开的小算子，收益递减。
 5. **`find_roots_batched` 里的 `torch.linalg.eigvals`**：见 §16.14。改动六之后它已经重新变成前向里最大的一项（本机 batch 512：`linalg_eig` + `linalg_eigvals` 合计占设备侧时间 37%），是服务器上**最后**一个大头。
 
-### 16.14 `find_roots_batched` 的 `eigvals`：为什么它慢，以及一条还没走完的路
-
-**它慢在哪**（全部本机实测，batch 512 的 14×14 复矩阵）：
-
-```
-eigvals complex64 (现状)   15.90 ms     eigvals float32          7.53 ms
-eigvals complex128         21.62 ms     eigvals float64         10.29 ms
-eigvals complex64 在 CPU   15.92 ms  <-- 与 GPU 完全相同
-eigvalsh 14x14 complex64    0.38 ms  <-- 快 42x
-n=8 5.673 | n=14 16.411 | n=16 21.435 | n=32 88.594 ms       (eigvals)
-n=8 0.375 | n=14  0.424 | n=16  0.446 | n=32  2.981 ms       (eigvalsh)
-分块 32/64/128/256: 19.5 / 16.6 / 16.0 / 16.6 ms（分块无益）
-torch.set_num_threads(1/2/4/8): 16.26 / 14.12 / 15.02 / 16.06 ms（无影响）
-preferred_linalg_library cusolver/magma: 15.82 / 16.59 ms（无影响）
-```
-
-⇒ 成本由**每矩阵固定开销**主导（8×8 与 14×14 只差 2.9×，远低于 O(n³) 的 5.4×），且**与设备无关**（CPU 上一样慢）。所以降次、换 dtype、换 device、换 linalg 后端都救不了；唯一出路是**别用非对称求解器**。
-
-**已确认的数学结构**：那个 15 系数多项式是**自逆（self-inversive）**的，`a_k = conj(a_{2m-k})`（实测残差 2.98e-08，float32 舍入量级；用 `R(z) = z^{2m} conj(p(1/conj z)) / p(z)` 判据得 `|R| = 1.000000 ± 3e-6`）。它的 14 个根**成"同角度、模互为倒数"的 7 对**：
-
-```
-sample 0: (-119.906,1.3992) (-119.906,0.7147)   <- 1/1.3992 = 0.7147
-          (-75.114,13.8636) (-75.114,0.0721)
-          ...
-|z| 分位数 0.356 / 0.541 / 1.001 / 1.849 / 2.809   (min 0.0721, max 13.86)
-```
-
-**注意根离单位圆非常远**。这直接判了另一条路的死刑：曾试过"在单位圆上粗扫 `|p(e^{iω})|`、取 M 个极小值当种子再做 Newton 复根"，实测 **29.3% 的样本误差超过 1 度、最大 77.7 度，且比它要替代的 `eigvals` 还慢 35 倍**。原因是前提就不成立 —— 极小值位置不对应根的角度，"离圆最近的根"排序里 rank 1 与 rank 2 平均隔 0.285，第 2 个源的角度在圆上根本找不到对应极小值。**这条路的失败是方法性的，不是调参问题。**
-
-**还没走完的路（已实测判定：走不通）**：同角度成对曾让人以为 `p(z) = z^7 P(z + 1/z)` 成立、7 个 `w = z + 1/z` 是实数（`1.3992 + 1/1.3992 = 2.1139` …），从而变成"7 次实系数多项式在 `[-2,2]` 上的实根问题"，可用**对称三对角 + 秩一**的 Chebyshev 伴随矩阵走 `eigvalsh`（同规模是 `eigvals` 的 **40 倍**）。
-
-**实测结论：这个降次不成立。** `.scratch_probe.py` 的输出：
-
-```
-max|a_k - conj(a_14-k)| / max|a| = 1.987e-08      <- 自逆成立（这才是同角度成对的来源）
-max|a_k - a_14-k|       / max|a| = 2.395e-01      <- palindromic 不成立
-max|Im a| / max|a|               = 1.198e-01      <- 系数本质上是复数
-
-[1] identity  p(z)/z^7 =?= P(w),  w = z + 1/z
-    残差（实系数 deg-7 P，只取 Re a）  : 3.051e-01
-    残差（复系数 deg-7 P，朴素做法）    : 6.101e-01
-    精确分解 A(w) + i(z-1/z)B̃(w) 的残差 : 1.069e-07   <- 这才是真正的恒等式
-    || i(z-1/z)B̃ || / ||A||（能量占比） : 0.2722
-
-[3] deg-7 P(w) 的根 vs 参考角度
-    实 P：frac real = 0.1473，frac(|w|<=2 且 real) = 0.0000
-          与参考角度的最大差 29.47 度、平均 7.37 度
-```
-
-⇒ **自逆只保证"根成同角度、倒数模的对"，并不保证能写成 `w = z + 1/z` 的 7 次多项式。** 那需要 `a_k` 全为实数（即同时是 palindromic），而实测虚部占比 12%、逐对 `|Im a_j|/|a_j|` 高达 0.47~0.69。真正的恒等式带一个 `i(z - 1/z) B̃(w)` 修正项，能量占比 27%，丢掉它残差就是 0.3 量级。所以这条路**不是"还没走完"，而是走不通**；`eigvals` 在这个结构下没有便宜的替代。
-
-**本文件曾写错、现已更正的两处**：① "降次后 `P(w)` 的根是复的、57% 不满足 `|Re(w)| ≤ 2`、不可用" —— 结论碰巧对，但当时给的理由（递推选错基）不完整，真正原因是上面这条；② "反向传播占 96%、是固有成本" —— 见 §16.10 的更正。
-
-
-
 ### 16.12 指定 CUDA 设备（多卡 / 多人共用机器）
 
 本仓库所有代码把设备写死成模块级常量（`src/utils.py:32`、`src/data_handler.py:40`、`src/criterions.py:35` 都是 `cuda:0`），**业务脚本里没有 `--device` 之类的参数**。要换卡有两种做法，推荐第一种：
@@ -1171,7 +1119,15 @@ watch -n 5 nvidia-smi --query-gpu=utilization.gpu,memory.used --format=csv   # �
 GPU 争用会造成的是**几倍以内**的抖动：本机同一段代码、同一台机器先后跑出 514 ms/step 与 660 ms/step（28% 差），当时另一个任务正在共用这张 4060（`nvidia-smi` 显示 33% 利用率）。所以：
 
 - 看到的劣化在**几倍以内** ⇒ 值得查占用、用上面的环境变量换一张空闲卡。
-- 看到的劣化是**几百倍**（服务器的 `eigvals` 对比本机是 430×）⇒ 换卡没用，原因在算子本身（§16.14）。
+- 看到的劣化是**几百倍**（服务器的 `eigvals` 对比本机是 430×）⇒ 换卡没用，原因在算子本身（§16.14 的 `eigvals` 一节）。
+
+**★ 用做法二时踩过的一个坑（已修）**：`--device` 只改写了 `src.utils.device`，而 `src/criterions.py:35` 有**另一个**同名的导入期常量（`cuda:0`）。于是 `python bench_step_split.py --batch 2 512 --device 1` 在算 loss 时把预测搬到 `cuda:0`、目标却还在 `cuda:1`，报：
+
+```
+RuntimeError: Expected all tensors to be on the same device, but found at least two devices, cuda:0 and cuda:1!
+```
+
+修法见 §16.14 末尾：判据函数不再看那个导入期常量，而是**跟随传进来的预测张量所在的设备**。`CUDA_VISIBLE_DEVICES`（做法一）本来就把可见卡重编号成 `cuda:0`，所以从来没暴露这个问题。
 
 ### 16.13 改动六：`RMSPELoss` 也是逐样本循环 —— 这次是**反向**的大头
 
@@ -1242,3 +1198,102 @@ batch=2 同时从 13.7 ms/step 降到 10.0 ms/step（小 batch 下反向本来�
 
 **改完之后瓶颈又换人了**（本机 batch 512，设备侧时间）：`aten::linalg_eig` 与 `aten::linalg_eigvals` 合计占 37%，`Optimizer.step#Adam.step` 占 2%，其余是 `SliceBackward0` / `DiagonalBackward0` / `copy_` / `zeros` 这类分散的小算子。**现在反向已经比前向便宜了（7.4 ms vs 28.7 ms），前向重新成为大头**，而前向里能动的就是最后那一项 `eigvals` —— 见 §16.14。
 
+### 16.14 `find_roots_batched` 的 `eigvals`：为什么它慢，以及这条路已被判死
+
+**它慢在哪**（全部本机实测，batch 512 的 14×14 复矩阵）：
+
+```
+eigvals complex64 (现状)   15.90 ms     eigvals float32          7.53 ms
+eigvals complex128         21.62 ms     eigvals float64         10.29 ms
+eigvals complex64 在 CPU   15.92 ms  <-- 与 GPU 完全相同
+eigvalsh 14x14 complex64    0.38 ms  <-- 快 42x
+n=8 5.673 | n=14 16.411 | n=16 21.435 | n=32 88.594 ms       (eigvals)
+n=8 0.375 | n=14  0.424 | n=16  0.446 | n=32  2.981 ms       (eigvalsh)
+分块 32/64/128/256: 19.5 / 16.6 / 16.0 / 16.6 ms（分块无益）
+torch.set_num_threads(1/2/4/8): 16.26 / 14.12 / 15.02 / 16.06 ms（无影响）
+preferred_linalg_library cusolver/magma: 15.82 / 16.59 ms（无影响）
+```
+
+⇒ 成本由**每矩阵固定开销**主导（8×8 与 14×14 只差 2.9×，远低于 O(n³) 的 5.4×），且**与设备无关**（CPU 上一样慢）。所以降次、换 dtype、换 device、换 linalg 后端都救不了；唯一出路是**别用非对称求解器**。
+
+**已确认的数学结构**：那个 15 系数多项式是**自逆（self-inversive）**的，`a_k = conj(a_{2m-k})`（实测残差 2.98e-08，float32 舍入量级；用 `R(z) = z^{2m} conj(p(1/conj z)) / p(z)` 判据得 `|R| = 1.000000 ± 3e-6`）。它的 14 个根**成"同角度、模互为倒数"的 7 对**：
+
+```
+sample 0: (-119.906,1.3992) (-119.906,0.7147)   <- 1/1.3992 = 0.7147
+          (-75.114,13.8636) (-75.114,0.0721)
+          ...
+|z| 分位数 0.356 / 0.541 / 1.001 / 1.849 / 2.809   (min 0.0721, max 13.86)
+```
+
+**注意根离单位圆非常远**。这直接判了另一条路的死刑：曾试过"在单位圆上粗扫 `|p(e^{iω})|`、取 M 个极小值当种子再做 Newton 复根"，实测 **29.3% 的样本误差超过 1 度、最大 77.7 度，且比它要替代的 `eigvals` 还慢 35 倍**。原因是前提就不成立 —— 极小值位置不对应根的角度，"离圆最近的根"排序里 rank 1 与 rank 2 平均隔 0.285，第 2 个源的角度在圆上根本找不到对应极小值。**这条路的失败是方法性的，不是调参问题。**
+
+**关于降次的那条路（已实测判定：走不通）**：同角度成对曾让人以为 `p(z) = z^7 P(z + 1/z)` 成立、7 个 `w = z + 1/z` 是实数（`1.3992 + 1/1.3992 = 2.1139` …），从而变成"7 次实系数多项式在 `[-2,2]` 上的实根问题"，可用**对称三对角 + 秩一**的 Chebyshev 伴随矩阵走 `eigvalsh`（同规模是 `eigvals` 的 **40 倍**）。
+
+**实测结论：这个降次不成立。** `.scratch_probe.py` 的输出：
+
+```
+max|a_k - conj(a_14-k)| / max|a| = 1.987e-08      <- 自逆成立（这才是同角度成对的来源）
+max|a_k - a_14-k|       / max|a| = 2.395e-01      <- palindromic 不成立
+max|Im a| / max|a|               = 1.198e-01      <- 系数本质上是复数
+
+[1] identity  p(z)/z^7 =?= P(w),  w = z + 1/z
+    残差（实系数 deg-7 P，只取 Re a）  : 3.051e-01
+    残差（复系数 deg-7 P，朴素做法）    : 6.101e-01
+    精确分解 A(w) + i(z-1/z)B̃(w) 的残差 : 1.069e-07   <- 这才是真正的恒等式
+    || i(z-1/z)B̃ || / ||A||（能量占比） : 0.2722
+
+[3] deg-7 P(w) 的根 vs 参考角度
+    实 P：frac real = 0.1473，frac(|w|<=2 且 real) = 0.0000
+          与参考角度的最大差 29.47 度、平均 7.37 度
+```
+
+⇒ **自逆只保证"根成同角度、倒数模的对"，并不保证能写成 `w = z + 1/z` 的 7 次多项式。** 那需要 `a_k` 全为实数（即同时是 palindromic），而实测虚部占比 12%、逐对 `|Im a_j|/|a_j|` 高达 0.47~0.69。真正的恒等式带一个 `i(z - 1/z) B̃(w)` 修正项，能量占比 27%，丢掉它残差就是 0.3 量级。所以这条路**不是"还没走完"，而是走不通**；`eigvals` 在这个结构下没有便宜的替代。
+
+**本文件曾写错、现已更正的两处**：① "降次后 `P(w)` 的根是复的、57% 不满足 `|Re(w)| ≤ 2`、不可用" —— 结论碰巧对，但当时给的理由（递推选错基）不完整，真正原因是上面这条；② "反向传播占 96%、是固有成本" —— 见 §16.10 的更正。
+
+### 16.15 改动七：判据函数跟随预测张量的设备（修 `--device N` 上的 cuda:0/cuda:1 冲突）
+
+`src/criterions.py` 顶部和另外两个模块一样，有**导入期定死**的设备常量：
+
+```python
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+```
+
+`RMSPELoss.forward` / `MSPELoss.forward` 原来用它把预测搬到"默认卡"，于是 `--device 1`（或任何把工作卡设成非 0 的方式）下，预测被搬去 `cuda:0`、目标却还在 `cuda:1`：
+
+```
+RuntimeError: Expected all tensors to be on the same device, but found at least two devices, cuda:0 and cuda:1!
+```
+
+注意 `CUDA_VISIBLE_DEVICES=1` **不会**暴露这个问题 —— 它把可见卡重编号，进程里的 `cuda:0` 就是你要的那张；只有做法二（`--device`）会。
+
+**改法**：不再看那个导入期常量，改为**跟随传进来的预测张量**。新增一个模块级小工具，并在两个判据的 `forward` 开头取一次：
+
+```python
+def trainable_device(module, reference: torch.Tensor) -> torch.device:
+    """判据里临时张量该放哪：跟着预测张量走，而不是跟着导入期常量走。"""
+    cached = getattr(module, "_followed_device", None)
+    if cached is not None and cached == reference.device:
+        return cached
+    module._followed_device = reference.device
+    return reference.device
+
+
+        target_device = trainable_device(self, doa_predictions)
+        prediction_perm = permute_prediction_batched(doa_predictions).to(target_device)
+        error = (((prediction_perm - doa.to(target_device).unsqueeze(1)) + (np.pi / 2)) % np.pi) - np.pi / 2
+```
+
+三个细节：① 缓存放在**普通属性** `_followed_device` 上，不用 `register_buffer`（后者会进 `state_dict`，而且往里写 `torch.device` 会报类型错）；② `doa.to(target_device)` 让异卡时目标也能被显式搬过去，`requires_grad` 的目标仍然可导；③ 普通运行（预测本来就在 `src.utils.device` 上）行为完全不变，`new_device == predictions.device` 是恒等映射。
+
+**验证**：`verify_batched_ops.py` 新增的 `check_loss_device_pinning()`（`[3/4]`）把 `src.criterions.device` **故意指到 `cpu`**，预测与目标都在 GPU 上，断言两个判据的 loss 不变：
+
+```
+[3/4] 判据函数的设备跟随（回归：--device 1 时的 cuda:0/cuda:1 冲突）
+  RMSPELoss: 模块常量故意指错后 loss 差 0.000e+00  [OK]
+  MSPELoss:  模块常量故意指错后 loss 差 0.000e+00  [OK]
+```
+
+本机没有第二张卡，所以用"把模块常量指到 `cpu`"复现同一类错配；同时也用 `bench_step_split.py --batch 8 --device cpu` 跑通了非默认设备的完整路径（含 `forward`/`backward`/Adam，参数量 41761 校验通过）。
+
+> **换卡跑之前先 `git pull`**，否则 `--device N` 会在算 loss 时崩。

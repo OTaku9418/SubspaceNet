@@ -52,7 +52,7 @@ def timeit(fn, repeats=5, warmup=2):
 
 def check_gram(batches):
     """gram_diagonal_overload: batched vs the original per-sample loop."""
-    print("[1/2] gram_diagonal_overload 等价性 (批量版 vs 逐样本原始实现)")
+    print("[1/4] gram_diagonal_overload 等价性 (批量版 vs 逐样本原始实现)")
     worst = 0.0
     for batch_size in batches:
         Kx = (
@@ -99,7 +99,7 @@ def check_loss():
     """RMSPELoss: the vectorized forward vs the original per-sample loop, loss AND gradient."""
     from src.criterions import RMSPELoss
 
-    print("[2/3] RMSPELoss 等价性 (批量版 vs 逐样本原始实现, 含梯度)")
+    print("[2/4] RMSPELoss 等价性 (批量版 vs 逐样本原始实现, 含梯度)")
     criterion = RMSPELoss()
     worst_loss, worst_grad = 0.0, 0.0
     for m in (2, 3):
@@ -125,12 +125,48 @@ def check_loss():
     return worst_loss, worst_grad
 
 
+def check_loss_device_pinning():
+    """The criterion must follow the predictions, not the import-time `cuda:0` constant.
+
+    Regression test for: running on a second card (``--device 1`` or ``CUDA_VISIBLE_DEVICES=1``)
+    raised "Expected all tensors to be on the same device, but found at least two devices,
+    cuda:0 and cuda:1". The mismatch is reproduced here by pointing the module constant at the
+    wrong device on purpose; the criterion must ignore it.
+    """
+    import numpy as np
+
+    import src.criterions as crit_mod
+    from src.criterions import MSPELoss, RMSPELoss
+
+    print("[3/4] 判据函数的设备跟随（回归：--device 1 时的 cuda:0/cuda:1 冲突）")
+    original = crit_mod.device
+    worst = 0.0
+    try:
+        for name, criterion in (("RMSPELoss", RMSPELoss()), ("MSPELoss", MSPELoss())):
+            predictions = torch.rand(64, 2, device=device) * np.pi - np.pi / 2
+            targets = torch.rand(64, 2, device=device) * np.pi - np.pi / 2
+
+            crit_mod.device = device
+            expected = criterion(predictions.clone(), targets).item()
+            crit_mod.device = torch.device("cpu")   # wrong on purpose
+            got = criterion(predictions.clone(), targets).item()
+            crit_mod.device = original
+
+            diff = abs(got - expected)
+            worst = max(worst, diff)
+            flag = "OK" if diff < 1e-6 else "FAIL"
+            print(f"  {name}: 模块常量故意指错后 loss 差 {diff:.3e}  [{flag}]")
+    finally:
+        crit_mod.device = original
+    return worst
+
+
 def check_speed(batch_size=512, quick=False):
     """两处改动的提速比（仅供参考）。"""
     from src.models import find_roots_batched
     from src.utils import find_roots_torch
 
-    print("\n[3/3] 提速比 (本机, 仅供参考)")
+    print("\n[4/4] 提速比 (本机, 仅供参考)")
     Kx = (
         torch.randn(batch_size, 8, 8, dtype=torch.complex64, device=device)
         + 1j * torch.randn(batch_size, 8, 8, dtype=torch.complex64, device=device)
@@ -171,13 +207,16 @@ def main():
 
     worst = check_gram(batches)
     worst_loss, worst_grad = check_loss()
+    worst_device = check_loss_device_pinning()
     check_speed(quick=args.quick)
 
     print("\n=== 汇总 ===")
     print(f"  gram 最大偏差 {worst:.3e} (容差 {TOLERANCE_GRAM})")
     print(f"  RMSPELoss loss 差 {worst_loss:.3e} / 梯度相对差 {worst_grad:.3e}")
+    print(f"  判据函数的 device 跟随偏差 {worst_device:.3e} (容差 1e-6)")
     print(f"  root_music 的等价性与提速见 `python verify_root_music_batch.py`")
-    if worst >= TOLERANCE_GRAM or worst_loss >= 1e-4 or worst_grad >= 1e-5:
+    if (worst >= TOLERANCE_GRAM or worst_loss >= 1e-4 or worst_grad >= 1e-5
+            or worst_device >= 1e-6):
         print("  结论: 存在超差项, 请勿使用当前实现")
         sys.exit(1)
     print("  结论: 通过")
