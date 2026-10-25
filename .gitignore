@@ -10,3 +10,7 @@ data
 .vscode/
 .paper_extract/
 output.log
+literature/*
+results/*
+probe_*
+docs/*
