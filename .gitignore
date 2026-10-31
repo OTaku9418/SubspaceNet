@@ -14,3 +14,10 @@ literature/*
 results/*
 probe_*
 docs/*
+# 仓库约定: tools/ 放脚本(入库), artifacts/ 放脚本产物(不入库)
+artifacts/
+tools/**/__pycache__/
+__pycache__/
+*.pyc
+# pytest 的缓存目录（tests/ 里的回归测试）
+.pytest_cache/
