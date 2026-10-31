@@ -407,8 +407,9 @@ def _steering_batch_equivalence():
     """文档 §16.16: MUSIC 谱与 MVDR 响应的 18000 点网格扫描已向量化。
 
     两者都建立在 `SystemModel.steering_vec_batch` 上，所以先单独校验它；同时确认它在
-    `nominal=False` 时**拒绝**执行 —— 否则会悄悄抽失配参数、扰动全局随机流，
-    让数据生成不再可复现。
+    `nominal=False` 且**没给 gamma** 时拒绝执行 —— 否则会悄悄抽失配参数、扰动全局
+    随机流，让数据生成不再可复现。文档 §17 起支持通道幅相误差 Γ：给了 `gamma` 时
+    `nominal=False` 是**合法**调用，所以这里只校验"两个都不给"的那一种。
     """
     import numpy as np
 
@@ -423,13 +424,16 @@ def _steering_batch_equivalence():
         assert got.shape == ref.shape, f"{sig}: 形状 {got.shape} != {ref.shape}"
         worst = float(np.abs(got - ref).max())
         assert worst < 1e-12, f"{sig}: 最大偏差 {worst:.3e}，超出容差 1e-12"
+    # 只校验"既没给 gamma、又不是 nominal"这一种含糊调用；给了 gamma 就合法。
     try:
         sm.steering_vec_batch(angels, nominal=False)
     except ValueError:
         pass
     else:
-        raise AssertionError("steering_vec_batch(nominal=False) 本应抛 ValueError 却通过了")
-    return f"NarrowBand/Broadband 各 2000 点逐点相同；nominal=False 被正确拒绝"
+        raise AssertionError(
+            "steering_vec_batch(nominal=False) 且没给 gamma 时本应抛 ValueError 却通过了"
+        )
+    return f"NarrowBand/Broadband 各 2000 点逐点相同；含糊的 nominal=False 被正确拒绝"
 
 
 @check("评估路径分批与逐样本给出同一组数字（--eval_batch 不改变结果）")
@@ -524,6 +528,112 @@ def _eval_batch_consistency():
     return (f"{parts}（相对差 <1e-4；逐点最大差 "
             + "、".join(f"{c:.1e}" for _a, _b, c in detail.values())
             + f" deg）；最小特征值间隙 {gaps['min |l1|-|l2|']:.2e}")
+
+
+@check("通道幅相误差 Γ：σ=0 时全 1，且不扰动随机流")
+def _gamma_zero_is_free():
+    """文档 §17 引入 Γ = diag{(1+δg)·exp(j·δφ)}。
+
+    硬指标（任务书 §4.1）是 σ=0 时与改动前**逐位一致**，而这一点靠"零参数不消耗
+    随机数"来保证：若 `_draw_gamma` 用 uniform(0, 0) 而不是提前返回 ones，它会照旧
+    烧掉 2N 个随机数，后续所有抽样整体平移，数据就变了。
+    """
+    import numpy as np
+
+    from src.system_model import SystemModelParams
+
+    def fingerprint():
+        state = np.random.get_state()
+        return (state[0], state[1].tobytes(), state[2], state[3], state[4])
+
+    params = (
+        SystemModelParams()
+        .set_parameter("N", 8)
+        .set_parameter("M", 2)
+        .set_parameter("T", 100)
+    )
+    from src.system_model import SystemModel
+
+    model = SystemModel(params)
+
+    before = fingerprint()
+    gamma = model._draw_gamma()
+    after_draw = fingerprint()
+    assert after_draw == before, "_draw_gamma 在 σg=σφ=0 时消耗了随机数"
+    assert np.all(gamma == 1.0), f"σ=0 时 Γ 应当全 1，实测 |Γ-1| 最大 {np.abs(gamma - 1).max():.3e}"
+    assert gamma.dtype == np.complex128, f"Γ 的 dtype 是 {gamma.dtype}，应为 complex128"
+
+    np.random.seed(0)
+    model.steering_vec(np.array([0.3]), nominal=True)
+    after_nominal = fingerprint()
+    np.random.seed(0)
+    model.steering_vec(np.array([0.3]), nominal=True)
+    assert after_nominal == fingerprint(), "nominal 导向矢量消耗了随机数"
+
+    return f"|Γ-1| max = {np.abs(gamma-1).max():.1e}；_draw_gamma / nominal 均零消耗"
+
+
+@check("通道幅相误差 Γ：标准差等于 σg，且同一 Γ 跨信源共享、与来向无关")
+def _gamma_statistics_and_sharing():
+    """文档 §17：g_m = 1 + √12·σg·ξ（ξ~U[-1/2,1/2]）的标准差**恰好**是 σg。
+
+    同时验证物理上最关键的一条：Γ 是**阵列**属性，同一阵列不会因为来向不同就换一套
+    通道响应 —— 否则 SubspaceNet 学到的"失配"就不是失配，而是每个信源各有一个随机
+    增益，问题本身不可解。
+    """
+    import numpy as np
+
+    from src.signal_creation import Samples
+    from src.system_model import SystemModelParams
+
+    sigma_g, sigma_phi_deg = 0.1, 5.0
+    params = (
+        SystemModelParams()
+        .set_parameter("N", 8)
+        .set_parameter("M", 2)
+        .set_parameter("T", 100)
+        .set_parameter("snr", 10)
+        .set_parameter("eta", 0.0)
+        .set_parameter("bias", 0.0)
+        .set_parameter("sv_noise_var", 0.0)
+        .set_parameter("gain_err_std", sigma_g)
+        .set_parameter("phase_err_std_deg", sigma_phi_deg)
+    )
+
+    # --- 统计量 ---
+    # 容差按各统计量自身的抽样误差给：32000 个样本时 mean φ 的标准误约
+    # σφ/√n = 5/179 ≈ 0.03°，所以均值的容差必须是 0.2° 量级，不能和 std 共用 0.02。
+    np.random.seed(2024)
+    sam = Samples(params)
+    draws = np.stack([sam._draw_gamma() for _ in range(4000)])
+    gains = np.abs(draws).ravel()
+    phases = np.rad2deg(np.angle(draws)).ravel()
+    worst = 0.0
+    for name, got, want, tol in (
+        ("mean|g|", gains.mean(), 1.0, 0.005),
+        ("std|g|/σg", gains.std() / sigma_g, 1.0, 0.02),
+        ("mean φ", phases.mean(), 0.0, 0.2),
+        ("std φ/σφ", phases.std() / sigma_phi_deg, 1.0, 0.02),
+    ):
+        dev = abs(got - want)
+        worst = max(worst, dev / tol)
+        assert dev < tol, f"{name} = {got:.6f}，偏离 {want} 达 {dev:.4f}（容差 {tol}）"
+    span = float(np.abs(gains - 1.0).max())
+    assert span <= np.sqrt(3.0) * sigma_g + 1e-12, f"|g-1| 最大 {span:.4f} 超出 √3·σg"
+
+    # --- 跨信源共享 ---
+    sam.set_doa([-20.0, 30.0])
+    _samples, _signal, A, _noise = sam.samples_creation()
+    ratios = [
+        A[:, column] / sam.steering_vec(theta, nominal=True)
+        for column, theta in enumerate(sam.doa)
+    ]
+    spread = float(np.abs(ratios[0] - ratios[1]).max())
+    assert spread < 1e-12, f"两个信源除出来的 Γ 不同（最大差 {spread:.3e}），Γ 没在信源间共享"
+    assert not np.allclose(ratios[0], np.ones(8)), "Γ 全是 1，这个检查什么都没测到"
+
+    return (f"σg={sigma_g} σφ={sigma_phi_deg}°: std|g|={gains.std():.4f} "
+            f"stdφ={phases.std():.3f}° |g-1|≤{span:.4f}；跨信源 Γ 差 {spread:.1e}")
 
 
 @check("RMSPELoss 的批量实现与逐样本原始实现等价（loss 与梯度）")

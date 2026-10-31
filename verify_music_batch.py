@@ -120,12 +120,18 @@ def check_steering(quick=False):
         worst = max(worst, diff)
         print(f"  {signal_type:10s} shape ref={ref.shape} got={got.shape}  max|diff|={diff:.3e}")
         assert ref.shape == got.shape, f"shape mismatch: {ref.shape} vs {got.shape}"
+    # 只校验"既没给 gamma、又不是 nominal"这一种含糊调用；给了 gamma 就合法。
     try:
         system_model.steering_vec_batch(np.array([0.1]), nominal=False)
     except ValueError:
-        print("  nominal=False 被正确拒绝 (不会悄悄消耗随机数)")
+        print("  含糊的 nominal=False 被正确拒绝 (不会悄悄消耗随机数)")
     else:
-        raise AssertionError("steering_vec_batch(nominal=False) 应当抛 ValueError")
+        raise AssertionError(
+            "steering_vec_batch(nominal=False) 且没给 gamma 时应当抛 ValueError"
+        )
+    gamma = np.ones(system_model.params.N, dtype=np.complex128)
+    with_gamma = system_model.steering_vec_batch(np.array([0.1]), gamma=gamma)
+    assert with_gamma.shape == (1, system_model.params.N), "给了 gamma 时应当正常返回 (G, N)"
     assert worst < TOLERANCE, f"steering_vec_batch 偏差 {worst:.3e} >= {TOLERANCE}"
     print(f"  => 通过 (max|diff| = {worst:.3e} < {TOLERANCE})")
 
