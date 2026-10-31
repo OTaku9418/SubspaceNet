@@ -157,6 +157,27 @@ SCENARIOS = {
         "train_at": 0.5,
         "folder": "array_mismatch_sv_noise",
     },
+    # 场景 3: 通道增益误差（幅相误差的幅度部分）。sigma_g 是**线性比值**，0.05 = 5%。
+    # 网格按 `ARRAY_MISMATCH_BANDS.md` 的三档校准状态两端加密：
+    # 0.03≈校准后(C 档 0.2-0.5 dB)、0.06≈未逐通道校准(B 档 0.5 dB)、
+    # 0.1=Guo 2022 的重度档、0.3 是明确失效区。
+    "gain": {
+        "sweep_param": "gain_err_std",
+        "grid": [0.0, 0.03, 0.06, 0.1, 0.2, 0.3],
+        "train_at": 0.1,
+        "folder": "array_mismatch_gain",
+        # 物理上正确的口径：位置/幅相每样本抽一次、多信源共享同一副阵列
+        "shared_array_mismatch": True,
+    },
+    # 场景 4: 通道相位误差（度）。0×/2°/4° 对应 C/B 档，20° 对应 A 档(±20° 的号称)，
+    # 40° 是 Fang 2026 的重度档。
+    "phase": {
+        "sweep_param": "phase_err_std_deg",
+        "grid": [0.0, 2.0, 4.0, 10.0, 20.0, 40.0],
+        "train_at": 10.0,
+        "folder": "array_mismatch_phase",
+        "shared_array_mismatch": True,
+    },
 }
 
 
@@ -223,7 +244,9 @@ def as_pred_array(predictions) -> np.ndarray:
 # 系统模型构造
 # ------------------------------------------------------------------------------
 def make_params(eta: float = 0.0, sv_noise_var: float = 0.0,
-                m: int = M_SOURCES, t: int = T_SNAPSHOTS) -> SystemModelParams:
+                m: int = M_SOURCES, t: int = T_SNAPSHOTS,
+                gain_err_std: float = 0.0, phase_err_std_deg: float = 0.0,
+                shared_array_mismatch: bool = False) -> SystemModelParams:
     """按复现要求构造 SystemModelParams (bias 显式置 0)。"""
     return (
         SystemModelParams()
@@ -236,6 +259,23 @@ def make_params(eta: float = 0.0, sv_noise_var: float = 0.0,
         .set_parameter("eta", float(eta))
         .set_parameter("bias", BIAS)
         .set_parameter("sv_noise_var", float(sv_noise_var))
+        .set_parameter("gain_err_std", float(gain_err_std))
+        .set_parameter("phase_err_std_deg", float(phase_err_std_deg))
+        .set_parameter("shared_array_mismatch", bool(shared_array_mismatch))
+    )
+
+
+def params_for(scenario: str, value: float) -> SystemModelParams:
+    """按"场景名 + 该场景当前扫描值"构造 SystemModelParams。
+
+    收口点：`make_params(**{cfg["sweep_param"]: value})` 原先散落在 5 处（训练集、
+    测试集、训练、评估、`samples_model`）。场景现在除了扫描参数之外还带自己的
+    非扫描参数（`shared_array_mismatch`），逐处手改迟早漏一处 —— 统一走这里。
+    """
+    cfg = SCENARIOS[scenario]
+    return make_params(
+        **{cfg["sweep_param"]: value},
+        shared_array_mismatch=bool(cfg.get("shared_array_mismatch", False)),
     )
 
 
@@ -263,6 +303,14 @@ CURVE_LABELS = {
     "SubNet+r-music": "SubspaceNet + Root-MUSIC", "r-music": "Root-MUSIC",
     "SubNet+esprit": "SubspaceNet + ESPRIT", "esprit": "ESPRIT",
     "SubNet+music": "SubspaceNet + MUSIC", "music": "MUSIC",
+}
+# 曲线图的横轴标题。顺序/键与 SCENARIOS 的 sweep_param 对应; 新场景别让横轴只显示
+# 一个裸的变量名 —— 单位信息(度数 vs 线性比值)必须出现在轴上。
+SWEEP_LABELS = {
+    "eta": "array mismatch level ($\\eta$)",
+    "sv_noise_var": "steering-vector noise variance ($\\sigma^2_{sv}$)",
+    "gain_err_std": "channel gain error std ($\\sigma_g$, linear)",
+    "phase_err_std_deg": "channel phase error std ($\\sigma_\\phi$, deg)",
 }
 # 传给仓库 `plot_spectrum` 的 algorithm 字符串只用来做分派, 但它会先判 "music"
 # (src/plotting.py:62-69)。因此 Root-MUSIC 这一路必须用一个**不含** "music" 子串
@@ -574,7 +622,8 @@ def plot_curve_figures(json_paths, out_dir: Path, metrics=("deg", "ref"),
                                 ls="-" if enhanced else "--",
                                 color=CURVE_COLORS.get(key, "gray"),
                                 label=CURVE_LABELS.get(key, key))
-                ax.set_xlabel(f"array mismatch level ({sweep_name})")
+                ax.set_xlabel(SWEEP_LABELS.get(
+                    sweep_name, f"array mismatch level ({sweep_name})"))
                 ax.set_ylabel(ylabel)
                 ax.set_title(f"Fig. 9 reproduction - {scenario} mismatch\n"
                              f"train protocol: {payload.get('train_levels', '?')} | {note}",
@@ -594,49 +643,43 @@ def plot_curve_figures(json_paths, out_dir: Path, metrics=("deg", "ref"),
 
 
 def enable_nominal_steering_without_repo_edit():
-    """让 MUSIC / MVDR 能在"未改动仓库源码"的前提下跑起来.
+    """确认 `steering_vec(..., nominal=True)` 能用；不能用就报错叫人去改源码。
 
-    背景 (真实 bug, 已在 Python 3.10 + torch 2.0.1 实测复现):
-      `src/system_model.py:161-188` 的 `steering_vec(..., nominal=True)` 分支
-      (:175-176) 只给 `mis_distance` / `mis_geometry_noise` 赋了 0, **漏了
-      `uniform_bias`**; 而 :184 无条件使用 `(uniform_bias + mis_distance + ...)`,
-      于是 nominal=True 时抛
+    背景 (真实 bug): `src/system_model.py` 的 `steering_vec(..., nominal=True)` 分支
+    早期只给 `mis_distance` / `mis_geometry_noise` 赋了 0, **漏了 `uniform_bias`**,
+    而后面无条件使用 `(uniform_bias + mis_distance + ...)`, 于是 nominal=True 时抛
         UnboundLocalError: local variable 'uniform_bias' referenced before assignment
 
     受影响的调用点: `src/methods.py:270` (MUSIC 的 spectrum_calculation) 与
-    `src/methods.py:641` (MVDR) —— 两者都传 nominal=True。因此**本仓库的经典
-    MUSIC / MVDR 基线开箱即崩**。Root-MUSIC 与 ESPRIT 走求根路径、不调用
-    nominal 网格, 所以不受影响 (默认算法列表已因此只含这两个)。
+    `src/methods.py:641` (MVDR) —— 两者都传 nominal=True。
 
-    这里用一个只补 `uniform_bias = 0` 的包装器就地替换掉该方法: 语义与
-    "nominal 阵列 = 无失配" 完全一致 (η/σ²_sv 也同样是 0), 是论文式(21)中
-    δ_m=0 的理想导向矢量。若你选择直接改仓库源码 (推荐, 见指导文档 §12),
-    可把 `--algorithms` 里加上 music, 本包装器会自动发现源码已修好而跳过。
+    **本函数现在只做检查, 不再打 monkeypatch。** 原因是 `steering_vec` 已经加上了
+    `gamma` / `state` / `sv_noise` 三个参数(文档 §17), 一个自带签名的包装器会把这些
+    新参数吞掉, 让 `shared_array_mismatch=True` 的数据生成直接 TypeError —— 曾经
+    就是这么炸的。源码已在 `src/system_model.py:176` 修好
+    (`uniform_bias, mis_distance, mis_geometry_noise = 0, 0, 0`), 所以这里用一次
+    真实调用来探测, 探测不过就明确要求去改源码, 而不是偷偷替换实现。
     """
-    import inspect
+    import numpy as np
 
-    from src.system_model import SystemModel
+    from src.system_model import SystemModel, SystemModelParams
 
-    original = SystemModel.steering_vec
+    params = (
+        SystemModelParams()
+        .set_parameter("N", 8)
+        .set_parameter("M", 2)
+        .set_parameter("T", 10)
+    )
     try:
-        src = inspect.getsource(original)
-    except OSError:
-        src = ""
-    if "mis_distance, mis_geometry_noise = 0, 0" in src and "uniform_bias = 0" in src:
-        return False  # 源码已修好
-
-    def patched(self, theta, f=1, array_form="ULA", nominal=False):
-        if not nominal:
-            return original(self, theta, f=f, array_form=array_form, nominal=False)
-        return np.exp(
-            -2j * np.pi * {"NarrowBand": 1, "Broadband": f}[self.params.signal_type]
-            * self.dist[self.params.signal_type] * self.array * np.sin(theta)
-        )
-
-    SystemModel.steering_vec = patched
-    print("[fix  ] 已启用 uniform_bias 用户态补丁 (源码 nominal 分支漏赋值), "
-          "MUSIC/MVDR 可用; 详见指导文档 §12")
-    return True
+        SystemModel(params).steering_vec(np.array([0.0]), nominal=True)
+    except UnboundLocalError as exc:  # pragma: no cover - 只在未修源码的副本上触发
+        raise RuntimeError(
+            "`steering_vec(nominal=True)` 仍然抛 UnboundLocalError（缺 uniform_bias 赋值）。"
+            "请直接把 src/system_model.py 里 nominal 分支改成 "
+            "`uniform_bias, mis_distance, mis_geometry_noise = 0, 0, 0`（见文档 §12）。"
+            "不要再依赖用户态 monkeypatch：它会吞掉 gamma/state/sv_noise 参数。"
+        ) from exc
+    return False
 
 
 def load_or_create_train(scenario: str, value: float, samples: int, force: bool = False):
@@ -644,7 +687,7 @@ def load_or_create_train(scenario: str, value: float, samples: int, force: bool 
     cfg = SCENARIOS[scenario]
     path = datasets_dir(scenario) / "train"
     path.mkdir(parents=True, exist_ok=True)
-    params = make_params(**{cfg["sweep_param"]: value})
+    params = params_for(scenario, value)
     tag = f"{cfg['sweep_param']}={value}".replace(".", "p")
     fname = f"SubspaceNet_DataSet_{scenario}_{tag}_n{samples}.pt"
     if not force and (path / fname).exists():
@@ -674,7 +717,7 @@ def load_or_create_test(scenario: str, value: float, samples: int, force: bool =
     cfg = SCENARIOS[scenario]
     path = datasets_dir(scenario) / "test"
     path.mkdir(parents=True, exist_ok=True)
-    params = make_params(**{cfg["sweep_param"]: value})
+    params = params_for(scenario, value)
     tag = f"{cfg['sweep_param']}={value}".replace(".", "p")
     model_f = f"SubspaceNet_DataSet_{scenario}_{tag}_n{samples}.pt"
     generic_f = f"Generic_DataSet_{scenario}_{tag}_n{samples}.pt"
@@ -703,7 +746,7 @@ def load_or_create_test(scenario: str, value: float, samples: int, force: bool =
 def train_one(scenario: str, value: float, train_ds, epochs: int, batch_size: int,
               out_dir: Path, smoke: bool = False):
     cfg = SCENARIOS[scenario]
-    params = make_params(**{cfg["sweep_param"]: value})
+    params = params_for(scenario, value)
     model_config = (
         ModelGenerator()
         .set_model_type("SubspaceNet")
@@ -765,7 +808,7 @@ def eval_on_test(scenario: str, value: float, model_test_ds, generic_test_ds,
                  capture_dir: Path | None = None, capture_index: int = 0,
                  subnet_batch: int = 1):
     cfg = SCENARIOS[scenario]
-    params = make_params(**{cfg["sweep_param"]: value})
+    params = params_for(scenario, value)
     # 评估时必须用测试集自己的系统模型 (决定导向矢量/频率)
     model_config = (
         ModelGenerator().set_model_type("SubspaceNet")
@@ -1026,7 +1069,7 @@ def run(scenario: str, args):
         model_test_ds, generic_test_ds = load_or_create_test(
             scenario, value, n_test, force=args.force_data
         )
-        samples_model = SystemModel(make_params(**{sweep: value}))
+        samples_model = SystemModel(params_for(scenario, value))
         res = eval_on_test(
             scenario, value, model_test_ds, generic_test_ds, samples_model,
             ckpt, args.algorithms, limit=args.limit,
@@ -1065,7 +1108,9 @@ def run(scenario: str, args):
         {"scenario": scenario, "config": {
             "N": N_SENSORS, "M": M_SOURCES, "T": T_SNAPSHOTS, "snr": SNR_DB,
             "tau": TAU_LAGS, "n_train": n_train, "n_test": n_test,
-            "batch_size": batch_size, "epochs": epochs, "lr": LR, "bias": BIAS},
+            "batch_size": batch_size, "epochs": epochs, "lr": LR, "bias": BIAS,
+            "sweep_param": cfg["sweep_param"],
+            "shared_array_mismatch": bool(cfg.get("shared_array_mismatch", False))},
          "train_levels": args.train_levels, "rows": rows},
         indent=2, ensure_ascii=False), "utf-8")
     print(f"\n结果已写入 {out_json}")

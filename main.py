@@ -86,6 +86,9 @@ if __name__ == "__main__":
         .set_parameter("eta", 0)
         .set_parameter("bias", 0.05)
         .set_parameter("sv_noise_var", 0)
+        .set_parameter("gain_err_std", 0.0)
+        .set_parameter("phase_err_std_deg", 0.0)
+        .set_parameter("shared_array_mismatch", False)
     )
     # Generate model configuration
     model_config = (

@@ -91,6 +91,39 @@ class Samples(SystemModel):
             # Generate
             self.doa = np.array(doa) * D2R
 
+    def _build_manifold(self, doa, f=1, gamma=None, state=None) -> np.ndarray:
+        """把一组来向的导向矢量拼成 (N, M) 的阵列流形。
+
+        同一个样本内所有信源**共用**同一个 Γ（以及 Step B 下的同一组位置误差）——
+        这是物理要求：一副阵列不会因为来向不同就换一套通道响应。
+
+        Args:
+        -----
+            doa (np.ndarray): 来向数组（弧度），shape (M,)。
+            f (float, optional): 频率。Defaults to 1。
+            gamma (np.ndarray, optional): 长度 N 的复增益（Step A 路径）。
+            state (ArrayMismatchState, optional): 阵列级失配（Step B 路径）。
+
+        Returns:
+        --------
+            np.ndarray: shape (N, M) 的复数阵列流形。
+        """
+        vectors = []
+        for theta in doa:
+            if state is not None:
+                # Step B: 位置/幅相全由 state 给。steering-vector 加噪是**信源级**
+                # 的流形扰动(不是阵列属性), 所以仍然逐信源各抽一次、显式传进去,
+                # 这样 steering_vec(state=...) 自身保持零随机消耗.
+                sv_noise = np.sqrt(self.params.sv_noise_var) * (
+                    np.random.randn(self.params.N)
+                )
+                vectors.append(
+                    self.steering_vec(theta, f=f, state=state, sv_noise=sv_noise)
+                )
+            else:
+                vectors.append(self.steering_vec(theta, f=f, gamma=gamma))
+        return np.array(vectors).T
+
     def samples_creation(
         self,
         noise_mean: float = 0,
@@ -120,9 +153,20 @@ class Samples(SystemModel):
         signal = self.signal_creation(signal_mean, signal_variance)
         # Generate noise matrix
         noise = self.noise_creation(noise_mean, noise_variance)
+        # --- 阵列失配的抽样位置 -------------------------------------------------
+        # 必须放在 signal/noise **之后**: 这样同一 seed 下, 打开通道幅相误差的 run
+        # 与 σ=0 的 run 共享同一段信号与噪声, 两条曲线的差异只来自 Γ 本身.
+        if bool(self.params.shared_array_mismatch):
+            # Step B: 位置 + 幅相都是"阵列级"量, 每样本抽一次, 所有信源共用
+            mismatch_state = self._draw_mismatch_state()
+            gamma = None
+        else:
+            # Step A: 只有 Γ 每样本抽一次; bias/eta 仍在 steering_vec 内逐信源抽
+            mismatch_state = None
+            gamma = self._draw_gamma()
         # Generate Narrowband samples
         if self.params.signal_type.startswith("NarrowBand"):
-            A = np.array([self.steering_vec(theta) for theta in self.doa]).T
+            A = self._build_manifold(self.doa, f=1, gamma=gamma, state=mismatch_state)
             samples = (A @ signal) + noise
             return samples, signal, A, noise
         # Generate Broadband samples
@@ -136,7 +180,9 @@ class Samples(SystemModel):
                     f = -int(self.f_sampling["Broadband"]) + idx
                 else:
                     f = idx
-                A = np.array([self.steering_vec(theta, f) for theta in self.doa]).T
+                A = self._build_manifold(
+                    self.doa, f=f, gamma=gamma, state=mismatch_state
+                )
                 samples.append((A @ signal[:, idx]) + noise[:, idx])
                 SV.append(A)
             samples = np.array(samples)

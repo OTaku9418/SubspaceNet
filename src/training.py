@@ -44,7 +44,7 @@ from torch.optim import lr_scheduler
 from sklearn.model_selection import train_test_split
 from src.utils import *
 from src.criterions import *
-from src.system_model import SystemModel, SystemModelParams
+from src.system_model import SystemModel, SystemModelParams, mismatch_suffix
 from src.models import SubspaceNet, DeepCNN, DeepAugmentedMUSIC, ModelGenerator
 from src.evaluation import evaluate_dnn_model
 
@@ -539,4 +539,5 @@ def get_simulation_filename(
         + f"{system_model_params.signal_nature}_eta={system_model_params.eta}_"
         + f"bias={system_model_params.bias}_"
         + f"sv_noise={system_model_params.sv_noise_var}"
+        + mismatch_suffix(system_model_params)
     )

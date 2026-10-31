@@ -35,7 +35,7 @@ import itertools
 from tqdm import tqdm
 from src.signal_creation import Samples
 from pathlib import Path
-from src.system_model import SystemModelParams
+from src.system_model import SystemModelParams, mismatch_suffix
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
@@ -337,7 +337,8 @@ def set_dataset_filename(system_model_params: SystemModelParams, samples_size: f
         + f"{system_model_params.signal_nature}_{samples_size}_M={system_model_params.M}_"
         + f"N={system_model_params.N}_T={system_model_params.T}_SNR={system_model_params.snr}_"
         + f"eta={system_model_params.eta}_sv_noise_var{system_model_params.sv_noise_var}_"
-        + f"bias={system_model_params.bias}_"
-        + ".h5"
+        + f"bias={system_model_params.bias}"
+        + mismatch_suffix(system_model_params)
+        + "_.h5"
     )
     return suffix_filename
