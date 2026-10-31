@@ -316,12 +316,12 @@ SUBSPACENET_DATA_ROOT=/data/subspacenet python reproduce_array_mismatch.py all -
 
 ### 7.1 上全量之前先跑环境自检
 
-同目录下的 `preflight_check.py` 用 **~1 分钟、只读、不留垃圾**的方式验证 23 项前置条件，
+同目录下的 `preflight_check.py` 用 **~1 分钟、只读、不留垃圾**的方式验证 25 项前置条件，
 任何 `[FAIL]` 都意味着全量跑（数小时）会失败或结论无效：
 
 ```bash
-python preflight_check.py          # 22 项静态+轻量检查（跳过真实训练冒烟）
-python preflight_check.py --full   # 23 项，额外做一次真实训练冒烟（约 1 分钟）
+python preflight_check.py          # 24 项静态+轻量检查（跳过真实训练冒烟）
+python preflight_check.py --full   # 25 项，额外做一次真实训练冒烟（约 1 分钟）
 ```
 
 覆盖内容：Python/依赖版本、**CUDA 可用性**（`src/utils.py:32` 的 `device` 在 import 时定型，
@@ -330,7 +330,7 @@ import 前就必须可见 CUDA）、**GPU 上真的能算**（跑一次复数 `m
 **参数量 == 41761**、**RMSPE 缩放因子 == π/180**、**`nominal=True` 不再崩且 MUSIC 真能出数**、
 `create_dataset` 的二元组结构与张量形状、**失配真的进入数据**、**各失配水平共享同一批 DoA**、
 **`root_music` / `gram_diagonal_overload` / `esprit` / `RMSPELoss` 的批量实现与逐样本原始实现等价**、
-**判据函数跟随预测张量的设备**（换卡跑不会 cuda:0/cuda:1 冲突，见 §16.15）。
+**判据函数跟随预测张量的设备**（换卡跑不会 cuda:0/cuda:1 冲突，见 §16.15）、**通道幅相误差 Γ 的零随机消耗 / 统计量 / 跨信源共享**（见 §17.6）。
 退出码 0 = 全部通过。自检也顺手充当了"论文数字 vs 本仓库行为"的回归测试——
 如果你改了源码导致参数量或 RMSPE 口径变了，它会立刻报出来。
 
@@ -521,8 +521,8 @@ REFERENCES                            ← 直接结束，无附录
 
 - [ ] 用极小数据跑通一次并得到四行结果：`--n_train 40 --n_test 20 --epochs 1 --batch_size 8 --limit 20`（§13.5 有预期形状）
 - [ ] 评估侧给了 `--eval_batch 512`（否则 SubspaceNet 前向会按算法重算 3 遍；经典 MUSIC 的 18000 点网格不受它影响，见 §16.16）
-- [ ] `python preflight_check.py` 全绿（22 项：依赖/CUDA 真算一次/参数量 41761/RMSPE 口径 π/180/nominal 导向矢量/MUSIC 出数/数据管线/失配注入/DoA 可比性/六处批量实现的等价性/判据函数的设备跟随/评估分批一致性）
-- [ ] 需要连训练路径一起验时加 `--full`（23 项，约 1 分钟）
+- [ ] `python preflight_check.py` 全绿（24 项：依赖/CUDA 真算一次/参数量 41761/RMSPE 口径 π/180/nominal 导向矢量/MUSIC 出数/数据管线/失配注入/DoA 可比性/六处批量实现的等价性/判据函数的设备跟随/评估分批一致性/Γ 的零消耗与跨信源共享）
+- [ ] 需要连训练路径一起验时加 `--full`（25 项，约 1 分钟）
 
 **出图（PNG，见 §14）**
 
@@ -659,7 +659,7 @@ return predictions, response_curve     # src/methods.py:657-658
 - `--capture` 存 `params` 时若直接 `np.savez(dict)`，读回会撞 `ValueError: Object arrays cannot be loaded when allow_pickle=False`。**注意 `np.load` 是惰性的**——错误要到你真正取那个数组时才抛，所以 `try/except` 包住 `np.load` 本身没用，必须把数组全部取出来。现在存的是 JSON 字符串，并且 `_load_capture` 会为旧 npz 回退到 `allow_pickle=True`。
 - `RootMUSIC.narrowband` 返回的 `roots`（`src/methods.py:475-486`）是**全部 N 个根**（按到单位圆的距离排序），而 `doa_predictions` 只取单位圆内的前 M 个（`roots_inside = [root for root in roots if ((abs(root)-1) < 0)][:M]`）。画根图若按 `roots[:len(predictions)]` 取，会拿到半径 >1 的根。
 
-> 自检小抄：`python preflight_check.py` 全绿（22 项，见 §7.1），或 `python reproduce_array_mismatch.py all --scenario spacing --n_train 40 --n_test 20 --epochs 1 --batch_size 8 --limit 20` 能在 1–2 分钟内跑出上面这种形状的四行输出，说明**环境、依赖、CUDA、数据管线、三算法、指标口径**全部就绪，可以放心上全量了。
+> 自检小抄：`python preflight_check.py` 全绿（24 项，见 §7.1），或 `python reproduce_array_mismatch.py all --scenario spacing --n_train 40 --n_test 20 --epochs 1 --batch_size 8 --limit 20` 能在 1–2 分钟内跑出上面这种形状的四行输出，说明**环境、依赖、CUDA、数据管线、三算法、指标口径**全部就绪，可以放心上全量了。
 
 ---
 
@@ -840,7 +840,7 @@ python preflight_check.py --full
 
 这么改的用意：把这类错误**从"跑到第 3 项才炸、且报错位置随机"提前到第 1 组、并且直接给出结论**。第 1 组还会先做复数 `matmul` 与 `linalg.eig`——这正是 SubspaceNet 推理最依赖、也最容易撞 sm 问题的两个算子。
 
-（自检本身也在长：最近几轮陆续加了四处批量实现的等价性回归、以及判据函数的设备跟随检查，现在 `--full` 是 **23 项 / 0 FAIL**，见 §7.1。）
+（自检本身也在长：最近几轮陆续加了四处批量实现的等价性回归、以及判据函数的设备跟随检查，现在 `--full` 是 **25 项 / 0 FAIL**，见 §7.1。）
 
 ### 15.5 换 torch 版本的兼容性提醒（本项目特有）
 
@@ -1391,3 +1391,241 @@ python reproduce_array_mismatch.py eval --eval_batch 512 --device 0     # 正式
 2. 若要再省，可让评估**只跑需要的算法**（`--algorithms`），经典 MUSIC 现在已不是大头。
 
 
+## 17. 通道幅相误差 Γ：把实验从"间距 / 加噪"扩到"幅相"
+
+> 本节记录的是**新增**的能力，不在论文 Fig. 9 里。任务书在 `docs/TASK_gain_phase_errors.md`
+> （该目录被 `.gitignore` 的 `docs/*` 忽略，只在本地保留），本节是它的落地说明与实测记录。
+
+### 17.1 模型：Γ 是一个对角阵
+
+论文式 (21) 只描述**位置**失配（阵元间距 δ_m 偏离半波长）。真实阵列还有**通道**失配——
+每个阵元的复数响应（幅度 + 相位）各自偏离标称值，写成矩阵就是一个对角阵乘在流形左边：
+
+```
+Γ = diag{g_1, ..., g_N},     g_m = (1 + δg_m) · exp(j·δφ_m)
+```
+
+抽样方式（`√12` 不是随手写的）：
+
+```
+δg_m  = √12 · σ_g  · ξ_m,    ξ_m ~ U[-1/2, 1/2]
+δφ_m  = √12 · σ_φ  · ς_m,    ς_m ~ U[-1/2, 1/2]
+```
+
+均匀分布 `U[-1/2,1/2]` 的标准差是 `1/√12`，乘 `√12` 刚好把 `g_m` 的标准差标定成 **σ_g**
+本身（而不是 `σ_g/√12`）；取值范围因此是 `1 ± √3·σ_g`（峰值为标准差的 `√3` 倍，不是 3 倍）。
+这样 `σ_g` 才有"线性比值"的物理含义：`σ_g = 0.05` 就是"5% 的 1σ 幅度误差"。
+
+三个新参数（`src/system_model.py` 的 `SystemModelParams`）：
+
+| 参数 | 含义 | 默认 |
+|---|---|---|
+| `gain_err_std` | 幅度误差标准差 σ_g（线性比值，0.05 = 5%） | 0.0 |
+| `phase_err_std_deg` | 相位误差标准差 σ_φ（**度**） | 0.0 |
+| `shared_array_mismatch` | 见 §17.2 | False |
+
+### 17.2 Step A / Step B：Γ 属于阵列，不属于信源
+
+这是这一块唯一容易做错的设计点。`frames` 里每个样本有 M=2 个信源，而**一副阵列只有一套
+通道响应**——同一个样本里两个信源必须乘**同一个** Γ。原来 `steering_vec` 被每个信源各调
+一次，如果 Γ 就在里面抽，得到的会是"每个信源各有一套随机增益"，那不是阵列失配，而是让
+问题本身不可解。
+
+- **Step A（默认，`shared_array_mismatch=False`）**：Γ 在 `samples_creation` 里每样本抽
+  **一次**，两个信源共用；`bias` / `eta`（位置）的抽样位置**不动**，仍在 `steering_vec`
+  里逐信源抽。改动面最小，旧行为完全保留。
+- **Step B（`shared_array_mismatch=True`）**：`bias` / `eta` 也提升到每样本抽一次，与 Γ
+  一起打包成 `ArrayMismatchState(bias, dist_offset, gamma)` 传给 `steering_vec`。物理上
+  更自洽（位置与幅相同属阵列属性），但**会让现有 η 场景的数据变掉**，所以默认关闭。
+
+`state` 分支是**零随机消耗**的：所有抽样都发生过，`steering_vec(state=...)` 只做算术。
+唯一的例外是 steering-vector 加噪（`sv_noise_var`），它是**信源级**的流形扰动、不是阵列
+属性，所以仍逐信源各抽一次、由 `_build_manifold` 显式算好再传进去。
+
+抽样顺序也有讲究：`_draw_gamma()` / `_draw_mismatch_state()` 必须放在 signal 与 noise
+**之后**。这样同一个 seed 下，"开 Γ 的 run"与"σ=0 的 run"共享**逐位相同**的信号与噪声，
+两条曲线的差异只来自 Γ 本身。
+
+### 17.3 代码在哪
+
+| 位置 | 内容 |
+|---|---|
+| `src/system_model.py` `SystemModelParams` | 三个新参数 + 互耦占位注释 |
+| `src/system_model.py` `@dataclass ArrayMismatchState` | `bias` / `dist_offset` / `gamma` |
+| `src/system_model.py` `_draw_gamma()` | σ=0 时直接 `np.ones` 返回，**不消耗随机数** |
+| `src/system_model.py` `_draw_mismatch_state()` | 位置 + Γ 一起抽（Step B） |
+| `src/system_model.py` `_num_tag()` / `mismatch_suffix()` | 文件名后缀，两处文件名函数共用 |
+| `src/system_model.py` `steering_vec(...)` | 签名加 `gamma=` / `state=` / `sv_noise=` |
+| `src/system_model.py` `steering_vec_batch(...)` | 签名加 `gamma=`（MUSIC/MVDR 网格用） |
+| `src/signal_creation.py` `samples_creation` | 按 `shared_array_mismatch` 二选一 |
+| `src/signal_creation.py` `_build_manifold()` | 把 M 个导向矢量拼成 `(N, M)`，Γ 共用 |
+
+`steering_vec` 的返回值在两条路径上都是
+
+```
+(nominal_steering + sv_noise) * gamma
+```
+
+即 Γ 乘在**整个**流形外面（也乘在加噪项上，这是任务书的选择；`sv_noise_var=0` 时无差别）。
+
+**`nominal=True` 与 `gamma` 互斥**，同时给会抛 `ValueError`——nominal 的语义就是"无失配的
+理想流形"，乘一个 Γ 进去语义自相矛盾。`steering_vec_batch` 同理：`nominal=False` 但
+**不给** `gamma` 也抛错，因为"谁来抽 Γ"是不明确的，而偷偷抽会扰动全局随机流。
+
+一个容易踩的维度坑：`steering_vec_batch` 返回的是 `(G, N)`（G 个角度、N 个阵元），
+乘 Γ 只能写 `vectors * gamma[None, :]`；写成 `vec[:, None] * gamma[:, None]` 会广播成
+`(G, N, N)` 直接炸。任务书 §3.1(d) 在这处写错了，以代码为准。
+
+### 17.4 缓存与权重文件名：**条件**追加
+
+数据集文件名（`src/data_handler.py` `set_dataset_filename`）与权重文件名
+（`src/training.py` `get_simulation_filename`）都改成调同一个 `mismatch_suffix()`：
+
+- 三个参数**全是默认值**（0 / 0 / False）→ 后缀为空，文件名与以前**一字不差**；
+- 任意一个非默认 → 追加 `_sg=0p05_sphi=5p0_share=0`。
+
+实测：
+
+```
+全默认   _NarrowBand_non-coherent_2000_M=2_N=8_T=100_SNR=10_eta=0.05_sv_noise_var0_bias=0_.h5
+开 Γ    ... _bias=0_sg=0p1_sphi=10p0_share=1_.h5
+权重      SubspaceNet_..._sv_noise=0_sg=0p1_sphi=10p0_share=1
+```
+
+**为什么是"条件"而不是"无条件"**：σ=0 的数据与改动前**逐位相同**（§17.6 有哈希为证），
+所以沿用旧缓存、旧权重是安全的；无条件追加会让现有的 24 个权重文件全部失配，下次跑
+spacing 要重训 4 × 45 min。
+
+**为什么 `share` 也必须进名字**（哪怕两个 σ 都是 0）：零宽度的 `np.random.uniform(0, 0)`
+**照样消耗随机数**（实测 `uniform(0,0,size=1)`、`uniform(0,0,size=8)` 都消耗，
+只有 `np.ones` 不消耗）。现有代码在 η=bias=sv=0 时每信源仍烧 `1+N+N=17` 个随机数；
+Step B 把这三处抽样挪到样本级，抽样**次数**变了 ⇒ 后续所有数值整体平移 ⇒ 数据不同。
+只有 `_draw_gamma` 用 `np.ones` 提前返回，所以"σ=0 + Step A"才是真正的零消耗。
+
+### 17.5 新场景与网格
+
+`reproduce_array_mismatch.py` 的 `SCENARIOS` 新增两项，都跑 Step B：
+
+| scenario | `sweep_param` | grid | `train_at` |
+|---|---|---|---|
+| `gain` | `gain_err_std` | 0.0 / 0.03 / 0.06 / 0.1 / 0.2 / 0.3 | 0.1 |
+| `phase` | `phase_err_std_deg` | 0.0 / 2 / 4 / 10 / 20 / 40 | 10.0 |
+
+网格点的选取对着 `ARRAY_MISMATCH_BANDS.md`（仓库根）的三档真实校准值：
+
+- **C 档**（逐通道校准后）0.2–0.5 dB / 2–3° → σ_g ≈ 0.023–0.059、σ_φ ≈ 2–3°；
+- **B 档**（有源阵、未逐通道校准）0.5 dB / 4° → σ_g ≈ 0.059；
+- **A 档**（宽公差）5% / ±20°；
+- 文献重度档：Guo σ_g = 0.1 / σ_φ = 15°，Fang σ_ρ = 0.2 / σ_φ = 40°。
+
+所以 grid 是"0 → 校准后 → 未校准 → 宽公差 → 重度"一路排上去，而不是等距取点：
+0.03/0.06 落在 C 档内、0.1/15° 对上 Guo、0.3 已经超过 Fang。`train_at` 取网格中段而非
+端点，是沿用 spacing 场景的"逐点匹配"协议。
+
+横轴标签不再写裸变量名，改由 `SWEEP_LABELS` 映射：
+
+```
+eta              -> array mismatch level (η)
+sv_noise_var     -> steering-vector noise variance (σ²_sv)
+gain_err_std     -> channel gain error std (σ_g, linear)
+phase_err_std_deg-> channel phase error std (σ_φ, deg)
+```
+
+JSON 的 `config` 里同时记录 `sweep_param` 与 `shared_array_mismatch`，否则以后回看看不出
+这张图是用哪条路径生成的。
+
+### 17.6 怎么验证没改坏
+
+**第一层：σ=0 的逐位一致（硬指标）。** 在动 `src/` **之前**用 `probe_sigma0_baseline.py capture`
+把 5 个样本存下来，改完再 `verify` 用 `np.array_equal` 比。四组参数覆盖三条不同的随机消耗
+路径（只关、全开、只 η、Broadband），四个哈希在两次改动后各复验一次都**逐位相同**：
+
+```
+all_off   2d16da3bd9767e4f...      all_on    0eac9890ae413167...
+eta_only  09b647adcb8cc2b9...      broadband fa35800a1e63cb87...
+```
+
+**第二层：`tests/` 的 pytest 回归**（15 条，4 s 跑完）：
+
+```
+python -m pytest tests -q     ->  15 passed in 4.40s
+```
+
+覆盖：σ=0 零随机消耗且 Γ 全 1、生成器统计量与 `√3·σ` 硬边界、Γ 跨信源共享且与来向无关、
+缓存/权重文件名的条件追加、`steering_vec_batch` 与逐角度一致、两种 `ValueError`、
+Step B 的 `state` 路径零消耗、`samples_creation` 在 Step B 下跨信源共用同一组位置误差、
+`shared_array_mismatch=False` 时仍逐调用各抽一套、Γ 乘在 `(nominal + sv_noise)` 外面。
+
+一条测试写错过：σ_g=0 但 σ_φ=5° 时 `|Γ|` 是 1 只到 1e-16，用 `== 1.0` 会挂，必须
+`np.allclose(..., atol=1e-15)`。
+
+**第三层：`preflight_check.py` 加了两项。**
+
+```
+[PASS] 通道幅相误差 Γ：σ=0 时全 1，且不扰动随机流
+       |Γ-1| max = 0.0e+00；_draw_gamma / nominal 均零消耗
+[PASS] 通道幅相误差 Γ：标准差等于 σg，且同一 Γ 跨信源共享、与来向无关
+       σg=0.1 σφ=5.0°: std|g|=0.1000 stdφ=5.000° |g-1|≤0.1732；跨信源 Γ 差 0.0e+00
+```
+
+⇒ `python preflight_check.py` 现在是 **PASS=24 FAIL=0 SKIP=1**（`--full` 再加一条训练冒烟，
+约 1 分钟）。
+
+一处容差踩坑：`mean φ` 的标准误是 `σ_φ/√n = 5/179 ≈ 0.03°`，所以它的容差必须是 0.2°
+量级；一开始四个统计量共用 0.02，`mean φ = 0.052` 就被判成失败——那是正常涨落，不是 bug。
+
+**第四层：端到端冒烟。** `all --scenario gain --smoke --device 0` 与
+`--scenario phase --smoke` 都能跑通（建数据集 → 训练 → 评估 → JSON → 两张 PNG）。
+spacing 场景的回归也核过：`--limit 12 --grid 0.025` 得
+`SubNet+r-music=25.608° | +esprit=25.513° | +music=25.619° | r-music=3.933° | esprit=5.693° | music=8.859°`，
+经典三列与 §16.16 记录的基线**逐位相同**，连跑两次结果一致。
+
+> 冒烟只是流程验证，**数字没有意义**：3 epoch / 1620 个训练样本的网络当然打不过经典
+> 基线（冒烟里 SubNet 反而更差）。要看精度必须按 §7 的命令跑全量。
+
+### 17.7 实测：单点性能（本机 RTX 4060 Laptop）
+
+按"本地只跑一个点，用来估代码性能"的要求，在 `gain_err_std=0.1`（Step B）上测：
+
+| 项目 | 实测 | 外推到论文规模 |
+|---|---|---|
+| 数据生成 | **1.10 ms/样本**（8000 样本 8.82 s） | 45000 样本 ≈ **50 s** |
+| 训练 | **0.58 s/epoch**（7200 训练样本，batch 512） | 45000 样本 ≈ 3.6 s/epoch，80 epoch ≈ **5 min/模型** |
+
+训练那行要看清：`epochs=1` 测得 2.57 s/epoch、`epochs=4` 测得 0.58 s/epoch——差别是**首次
+迭代的 kernel 预热**（cudnn autotune + 首块显存分配），只有把 epoch 数拉到 4 才摊掉。
+这正好是 §16.13 那条教训的另一个版本：**单次计时不可信，必须摊掉预热**。
+
+外推到服务器要打折：服务器上 `linalg.eigvals` 是 552 µs/矩阵，本机 34 µs（16×），而前向
+的大头就是它；再叠上反向与 Adam，整步成本大约是**本机的 13–16 倍**。按 13× 算，
+80 epoch × 3.6 s × 13 ≈ **1 h/模型**。逐点匹配协议下 4–6 个网格点各训一个模型，
+就是 4–6 h —— 这才是服务器该干的活，本机只用来验证代码。
+
+### 17.8 顺手拆掉的一颗地雷
+
+`reproduce_array_mismatch.py` 里原来有个 `enable_nominal_steering_without_repo_edit()`，
+用 `inspect.getsource` 字符串匹配判断"源码是否还缺 `uniform_bias` 赋值"，缺就 monkeypatch
+一个只认 `(self, theta, f, array_form, nominal)` 的 `steering_vec`。
+
+`src/system_model.py:176` 早就修成 `uniform_bias, mis_distance, mis_geometry_noise = 0, 0, 0`
+了，但那个字符串匹配找的是 `"uniform_bias = 0"`（带等号），修好之后的写法里没有这个子串
+⇒ **补丁一直会被装上**。加上本周新增的 `gamma` / `state` / `sv_noise` 三个参数后，包装器
+把它们全吞掉，`shared_array_mismatch=True` 的数据生成直接炸：
+
+```
+TypeError: enable_nominal_steering_without_repo_edit.<locals>.patched()
+           got an unexpected keyword argument 'state'
+```
+
+改法：这个函数现在**只做检查、不再打补丁**——真调用一次 `steering_vec(nominal=True)`，
+抛 `UnboundLocalError` 就报一条明确的中文错误让人去改源码。留一个自带签名的影子实现比
+不修更危险：它会在签名演进时静默错位。
+
+### 17.9 还没做的
+
+1. **`sv_noise_var` 与 Γ 的耦合实验**没做。加噪项现在在 Γ 的内侧（`(nominal+n)·g`），若
+   改成外侧（`nominal·g + n`）语义是"噪声在通道之后注入"，两者在 `sv_noise_var=0` 时等价。
+2. **互耦**只留了占位注释（`mc_coeff`），没实现。真要加，是与 Γ 并列的另一个 mutiplicative
+   矩阵（带状 Toeplitz），落在 `samples_creation` 的同一处。
+3. **`train_levels=single` 与 gain/phase 的组合**没验证过（默认用 `matched`）。
+4. 全网格没跑（按约定本地不跑）。
