@@ -316,12 +316,12 @@ SUBSPACENET_DATA_ROOT=/data/subspacenet python reproduce_array_mismatch.py all -
 
 ### 7.1 上全量之前先跑环境自检
 
-同目录下的 `preflight_check.py` 用 **~1 分钟、只读、不留垃圾**的方式验证 25 项前置条件，
+同目录下的 `preflight_check.py` 用 **~1 分钟、只读、不留垃圾**的方式验证 26 项前置条件，
 任何 `[FAIL]` 都意味着全量跑（数小时）会失败或结论无效：
 
 ```bash
-python preflight_check.py          # 24 项静态+轻量检查（跳过真实训练冒烟）
-python preflight_check.py --full   # 25 项，额外做一次真实训练冒烟（约 1 分钟）
+python preflight_check.py          # 25 项静态+轻量检查（跳过真实训练冒烟）
+python preflight_check.py --full   # 26 项，额外做一次真实训练冒烟（约 1 分钟）
 ```
 
 覆盖内容：Python/依赖版本、**CUDA 可用性**（`src/utils.py:32` 的 `device` 在 import 时定型，
@@ -521,8 +521,8 @@ REFERENCES                            ← 直接结束，无附录
 
 - [ ] 用极小数据跑通一次并得到四行结果：`--n_train 40 --n_test 20 --epochs 1 --batch_size 8 --limit 20`（§13.5 有预期形状）
 - [ ] 评估侧给了 `--eval_batch 512`（否则 SubspaceNet 前向会按算法重算 3 遍；经典 MUSIC 的 18000 点网格不受它影响，见 §16.16）
-- [ ] `python preflight_check.py` 全绿（24 项：依赖/CUDA 真算一次/参数量 41761/RMSPE 口径 π/180/nominal 导向矢量/MUSIC 出数/数据管线/失配注入/DoA 可比性/六处批量实现的等价性/判据函数的设备跟随/评估分批一致性/Γ 的零消耗与跨信源共享）
-- [ ] 需要连训练路径一起验时加 `--full`（25 项，约 1 分钟）
+- [ ] `python preflight_check.py` 全绿（25 项：依赖/CUDA 真算一次/参数量 41761/RMSPE 口径 π/180/nominal 导向矢量/MUSIC 出数/数据管线/失配注入/DoA 可比性/六处批量实现的等价性/判据函数的设备跟随/评估分批一致性/Γ 的零消耗与跨信源共享/Γ 的相位规范）
+- [ ] 需要连训练路径一起验时加 `--full`（26 项，约 1 分钟）
 
 **出图（PNG，见 §14）**
 
@@ -659,7 +659,7 @@ return predictions, response_curve     # src/methods.py:657-658
 - `--capture` 存 `params` 时若直接 `np.savez(dict)`，读回会撞 `ValueError: Object arrays cannot be loaded when allow_pickle=False`。**注意 `np.load` 是惰性的**——错误要到你真正取那个数组时才抛，所以 `try/except` 包住 `np.load` 本身没用，必须把数组全部取出来。现在存的是 JSON 字符串，并且 `_load_capture` 会为旧 npz 回退到 `allow_pickle=True`。
 - `RootMUSIC.narrowband` 返回的 `roots`（`src/methods.py:475-486`）是**全部 N 个根**（按到单位圆的距离排序），而 `doa_predictions` 只取单位圆内的前 M 个（`roots_inside = [root for root in roots if ((abs(root)-1) < 0)][:M]`）。画根图若按 `roots[:len(predictions)]` 取，会拿到半径 >1 的根。
 
-> 自检小抄：`python preflight_check.py` 全绿（24 项，见 §7.1），或 `python reproduce_array_mismatch.py all --scenario spacing --n_train 40 --n_test 20 --epochs 1 --batch_size 8 --limit 20` 能在 1–2 分钟内跑出上面这种形状的四行输出，说明**环境、依赖、CUDA、数据管线、三算法、指标口径**全部就绪，可以放心上全量了。
+> 自检小抄：`python preflight_check.py` 全绿（25 项，见 §7.1），或 `python reproduce_array_mismatch.py all --scenario spacing --n_train 40 --n_test 20 --epochs 1 --batch_size 8 --limit 20` 能在 1–2 分钟内跑出上面这种形状的四行输出，说明**环境、依赖、CUDA、数据管线、三算法、指标口径**全部就绪，可以放心上全量了。
 
 ---
 
@@ -840,7 +840,7 @@ python preflight_check.py --full
 
 这么改的用意：把这类错误**从"跑到第 3 项才炸、且报错位置随机"提前到第 1 组、并且直接给出结论**。第 1 组还会先做复数 `matmul` 与 `linalg.eig`——这正是 SubspaceNet 推理最依赖、也最容易撞 sm 问题的两个算子。
 
-（自检本身也在长：最近几轮陆续加了四处批量实现的等价性回归、以及判据函数的设备跟随检查，现在 `--full` 是 **25 项 / 0 FAIL**，见 §7.1。）
+（自检本身也在长：最近几轮陆续加了四处批量实现的等价性回归、以及判据函数的设备跟随检查，现在 `--full` 是 **26 项 / 0 FAIL**，见 §7.1。）
 
 ### 15.5 换 torch 版本的兼容性提醒（本项目特有）
 
@@ -1568,7 +1568,7 @@ Step B 的 `state` 路径零消耗、`samples_creation` 在 Step B 下跨信源�
        σg=0.1 σφ=5.0°: std|g|=0.1000 stdφ=5.000° |g-1|≤0.1732；跨信源 Γ 差 0.0e+00
 ```
 
-⇒ `python preflight_check.py` 现在是 **PASS=24 FAIL=0 SKIP=1**（`--full` 再加一条训练冒烟，
+⇒ `python preflight_check.py` 现在是 **PASS=25 FAIL=0 SKIP=1**（`--full` 再加一条训练冒烟，
 约 1 分钟）。
 
 一处容差踩坑：`mean φ` 的标准误是 `σ_φ/√n = 5/179 ≈ 0.03°`，所以它的容差必须是 0.2°
@@ -1629,3 +1629,78 @@ TypeError: enable_nominal_steering_without_repo_edit.<locals>.patched()
    矩阵（带状 Toeplitz），落在 `samples_creation` 的同一处。
 3. **`train_levels=single` 与 gain/phase 的组合**没验证过（默认用 `matched`）。
 4. 全网格没跑（按约定本地不跑）。
+
+### 17.10 相位规范：把不可辨识的线性斜坡去掉
+
+**问题**。把失配写成 `y = Γ A s + n` 之后，Γ 是**过定**的：均匀线阵的导向矢量是
+Vandermonde 的，对任意斜率 `δ` 有
+
+```
+diag{exp(-j·2π·(d/λ)·m·δ)} · a(θ) = a(θ'),    sin θ' = sin θ + δ          (18)
+```
+
+实测残差 `1.144e-15`（δ = 0.02 rad/阵元，θ = 30° 时折合 Δθ = 1.332°）。也就是说
+"逐阵元一条线性相位斜坡"与"所有来向整体平移"产生**完全相同**的协方差：
+`(Γ, θ)` 与 `(Γ·D(-δ), θ⊕δ)` 是同一份数据。这段相位从数据里无法辨识，任何估计器
+（包括贝叶斯最优的）都只能挑一个代表元。不约束掉，它就会以"与算法无关的固定误差"
+混进 RMSPE —— 实测（600 次抽样、30° 来向）：
+
+| σ_φ | 折合 DoA 平移 rms | p90 |
+|---|---|---|
+| 4° | 0.218° | 0.336° |
+| 10° | 0.544° | 0.842° |
+| 20° | 1.088° | 1.712° |
+| 40° | **2.180°** | 3.694° |
+
+σ_φ = 40° 那一档的 RMSPE 里约 2.2° 是模型自带的地板，无论网络多好都压不掉。
+
+**"照着文献把参考阵元相位锚成 0"为什么不够**。只令 `φ_0 = 0` 等于给 Γ 乘一个全局
+相位 `exp(-jφ_0)`，那是标量，会被源信号吸收：协方差不变、斜坡照旧。必须真的把整条
+直线投影掉。Fang 那篇之所以能这么锚，是因为它的阵是稀布的虚拟阵、且只用未校准的
+M−4 个元素算误差；在 ULA 上这个锚定对协方差没有任何影响。
+
+**做法**（`src/system_model.py:apply_phase_gauge`）：对每个相位向量做最小二乘直线
+拟合，截距 + 斜率整条减掉，只留零均值、零斜率的残差。
+
+```python
+idx = np.arange(n, dtype=float)
+centered = idx - idx.mean()
+slope = (values @ centered) / (centered @ centered)
+fitted = values.mean(axis=-1, keepdims=True) + slope[..., None] * centered
+return values - fitted
+```
+
+`_draw_gamma_raw` 保持 Fang Eq.(63)(64) 原样（`ρ = 1 + √12 σ_ρ ε`、`φ = √12 σ_φ τ`），
+`_draw_gamma` 在外面套一层规范。这样"生成式与文献逐字一致"和"参数化不过定"两件事
+同时成立，也便于分别单测。
+
+**代价与口径**。减掉一条直线会让残余相位的标准差从 `σ_φ` 降到
+`sqrt((N-2)/N)·σ_φ`（N=8 时 **0.8657**）。这只影响"Γ 实际有多强"的直觉，不影响横轴
+标签：横轴上的 σ_φ 仍然是文献里那个 σ_φ，**没有重标定**（重标定会让 `σ_φ=40°` 变成
+46°，就不再是文献同一个量了）。文档与图注里按 0.8657 倍解读即可。
+
+**另一个坑：不要"顺手再把 φ_0 锚成 0"**。那样会往每一行加一个随机常数（全局相位，
+不可观测），存下来的 `angle(Γ)` 就多了一份噪声：实测 σ_φ=15° 时，原始 15.009° →
+只去斜坡 12.993° → 再锚 φ₀ 17.317°，标准差从 0.8657σ **虚高到 1.1538σ**，均值也不再
+为 0。任何基于 `angle(Γ)` 的统计检查都会读出假数，所以规范后保持零均值零斜率。
+
+**缓存怎么处理**。文件名**没改**（`mismatch_suffix` 只拼 σ_g / σ_φ / share 三个开关，
+不含规范版本）。这是有意为之：`σ_φ = 0` 时规范是**恒等变换**，gain 场景的历史数据集
+与权重全部仍然有效；只有 `σ_φ > 0` 的点数据会变。代价是**必须人工删掉服务器上
+phase 场景的旧数据与旧权重**（`data/datasets/array_mismatch_phase/`、
+`data/weights/array_mismatch/phase_*`），否则新旧混在一条曲线上。脚本启动时会对
+phase 场景打印一次提醒，结果 JSON 里也记了 `"phase_gauge": "ramp"` 便于事后分辨。
+
+**验证**（`python -m pytest tests -q` → 17 passed；`python preflight_check.py` → PASS=25
+FAIL=0 SKIP=1）：
+
+- 规范后残余斜率 < 1e-9°、截距 < 1e-9°；
+- `std φ/σ_φ ≈ sqrt((N-2)/N)`（容差 0.02）；
+- 幅度逐位不变（`|Γ|` 与相位规范无关，实测最大差 2.2e-16，来自复增益重建的 1 ulp 舍入）；
+- 同一个物理阵列加不同斜坡，规范后落回同一个 Γ（最大差 < 1e-12）；
+- `σ_φ = 0` 时 `_draw_gamma` 与 `_draw_gamma_raw` **逐位相同**（gain 历史缓存有效的前提）。
+
+**结论该下在哪**。规范之后，σ_φ 的"红线"回到文献量级：Swindlehurst 1992 的有限样本
+门槛是 `σ_a² > 1/(N·SNR)`，T=100、SNR=10 dB 时即 RGEA 3.2% / PEA 1.8°，再往上才是
+真正的失配效应；Fang 用的 σ_ρ=0.2、σ_φ=40° 是稀疏阵 + 3 源的极端档。本实验的结论区间
+建议落在 **σ_g ≤ 0.1、σ_φ ≤ 20°**，grid 右端保留 0.3 / 40° 只作为"两边一起崩"的边界参考。

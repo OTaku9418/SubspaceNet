@@ -141,6 +141,9 @@ WEIGHT_DECAY = 1e-9
 SCHED_STEP = 80
 SCHED_GAMMA = 0.2
 BIAS = 0.0             # 重要: 显式关闭参考代码默认的 0.05 共享位置偏置
+# Γ 的相位规范 (文档 §17.10): "ramp" = 去掉不可辨识的线性斜坡 (零均值零斜率).
+# 会写进结果 JSON, 用来分辨一份结果是加规范之前还是之后跑出来的。
+PHASE_GAUGE = "ramp"
 
 SCENARIOS = {
     # 场景 1: 阵元间距失配, 训练/评估用的 eta 网格
@@ -1051,6 +1054,12 @@ def run(scenario: str, args):
     else:
         fixed_at = args.train_at if args.train_at is not None else cfg["train_at"]
         print(f"[协议] 单一模型: 仅在 {sweep}={fixed_at} 训练, 在整个网格上评估 (鲁棒性消融)")
+    if sweep == "phase_err_std_deg" and any(float(v) > 0.0 for v in grid):
+        # 文档 §17.10: 相位里那条直线(截距+斜率)在 ULA 上等价于 DoA 平移, 不可辨识.
+        # 规范之后 sigma_phi != 0 的数据会变, 而缓存文件名没跟着变(见 §17.4 的取舍),
+        # 所以必须在启动时把这件事喊出来, 否则会拿旧数据跑出互相矛盾的两条曲线.
+        print("[相位] Γ 相位已去线性斜坡 (零均值零斜率, 标准差变成 0.8657·σφ); "
+              "σφ≠0 的旧数据集与旧权重必须删掉重跑, gain 场景不受影响")
 
     # 产物路径
     cap_dir = Path(args.capture_dir) if args.capture_dir else DATA_ROOT / "simulations" / "spectra"
@@ -1110,7 +1119,10 @@ def run(scenario: str, args):
             "tau": TAU_LAGS, "n_train": n_train, "n_test": n_test,
             "batch_size": batch_size, "epochs": epochs, "lr": LR, "bias": BIAS,
             "sweep_param": cfg["sweep_param"],
-            "shared_array_mismatch": bool(cfg.get("shared_array_mismatch", False))},
+            "shared_array_mismatch": bool(cfg.get("shared_array_mismatch", False)),
+            # Γ 的相位规范方式(文档 §17.10): "ramp" = 去掉不可辨识的线性斜坡.
+            # 写进 JSON 是为了以后能分辨"哪份结果是在加规范之前/之后跑出来的".
+            "phase_gauge": PHASE_GAUGE},
          "train_levels": args.train_levels, "rows": rows},
         indent=2, ensure_ascii=False), "utf-8")
     print(f"\n结果已写入 {out_json}")
