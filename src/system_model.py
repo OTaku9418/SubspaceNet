@@ -153,6 +153,54 @@ def mismatch_suffix(params: "SystemModelParams") -> str:
     )
 
 
+def apply_phase_gauge(phases: np.ndarray) -> np.ndarray:
+    """去掉相位向量里不可辨识的线性斜坡（最小二乘意义下的整条直线）。
+
+    置换不变性（为什么必须做）：均匀线阵的导向矢量是 Vandermonde 的，
+    `A(theta)[m, k] = exp(-j*2*pi*(d/lambda)*m*sin(theta_k))`，所以对任意斜率
+    `delta` 有
+
+        diag{exp(-j*2*pi*(d/lambda)*m*delta)} @ A(theta) == A(theta')
+
+    其中 `sin(theta') = sin(theta) + delta`。也就是说"逐阵元的线性相位斜坡"与
+    "来向整体平移"在协方差上**完全相同**：`(Gamma, theta)` 与
+    `(Gamma * D(-delta), theta + delta)` 产生同一份数据。这一段相位因此从数据里
+    根本无法辨识，任何估计器（包括贝叶斯最优的）都只能再挑一个代表元。不把它
+    约束掉，度量里就会混进一份与算法无关的误差：N=8、sigma_phi=40 度时它折合
+    来向平移的 rms 约 2.3 度。
+
+    关于"照文献锚定参考阵元"：只把阵元 0 的相位设为 0 是**不够**的 —— 那是给
+    Gamma 乘一个全局相位 `exp(-j*phi_0)`，属于标量，会被源信号吸收，协方差不
+    变，斜坡依然在。必须真的把斜坡投影掉。
+
+    这里**只**减直线，不再额外做"phi_0 = 0"的锚定：那一步同样是乘一个全局相位
+    （数据完全等价），但它会往每行加一个随机常数，使存下来的
+    `angle(gamma).std()` 从 `0.8657*sigma_phi` 虚高到 `1.1538*sigma_phi`、均值也
+    不再是 0，让任何基于 `angle(gamma)` 的统计检查都读出一个假的数。所以规范后
+    的相位保持**零均值、零斜率**，统计性质自洽。
+
+    注意：减去直线会让残余相位的标准差从 `sigma_phi` 降到
+    `sqrt((N-2)/N) * sigma_phi`（N=8 时 0.8657 倍）。生成式本身仍是
+    `SystemModel._draw_gamma_raw` 里逐字照抄的文献公式；这里只把不可辨识分量
+    投影掉，**不**重新标定，否则 "sigma_phi" 这个横轴标签就不再是文献里同一个量。
+
+    Args:
+        phases (np.ndarray): 相位（弧度），形状 `(..., N)`。
+
+    Returns:
+        np.ndarray: 同形状，每行已去掉线性斜坡（零均值、零斜率）。
+    """
+    values = np.asarray(phases, dtype=float)
+    n = values.shape[-1]
+    if n < 2:
+        return values
+    idx = np.arange(n, dtype=float)
+    centered = idx - idx.mean()
+    slope = (values @ centered) / (centered @ centered)
+    fitted = values.mean(axis=-1, keepdims=True) + slope[..., None] * centered
+    return values - fitted
+
+
 class SystemModel(object):
     def __init__(self, system_model_params: SystemModelParams):
         """Class used for defining the settings of the system model.
@@ -225,10 +273,10 @@ class SystemModel(object):
         """create an array of sensors locations"""
         self.array = np.linspace(0, self.params.N, self.params.N, endpoint=False)
 
-    def _draw_gamma(self) -> np.ndarray:
-        """抽一次通道幅相误差 Γ 的对角线（长度 N）。
+    def _draw_gamma_raw(self) -> np.ndarray:
+        """抽一次通道幅相误差 Γ 的对角线（长度 N），**未加规范**。
 
-        定义（Guo 等的标准生成式）：
+        定义（Fang 2026, Eq. (63)(64)，与 Guo 等一致）：
 
             g_m   = 1 + sqrt(12) * sigma_g * xi_m          xi_m  ~ U[-1/2, 1/2]
             phi_m =     sqrt(12) * sigma_phi * zeta_m      zeta_m ~ U[-1/2, 1/2]
@@ -243,6 +291,9 @@ class SystemModel(object):
         零幅相误差必须与历史随机流逐位一致，而 np.random.uniform(0, 0, size=N)
         是**会**消耗随机数的（零宽度不是 no-op）。
 
+        本函数产出的相位**未去线性斜坡**，只用于回归测试"生成式与文献逐字一致"；
+        真正给模型用的入口是 `_draw_gamma`（它在本函数之上套 `apply_phase_gauge`）。
+
         Returns:
             np.ndarray: shape (N,) 的 complex128 复增益。
         """
@@ -255,6 +306,31 @@ class SystemModel(object):
         gain = 1.0 + np.sqrt(12.0) * sigma_g * xi
         phase = np.sqrt(12.0) * sigma_phi * zeta
         return (gain * np.exp(1j * phase)).astype(np.complex128)
+
+    def _draw_gamma(self) -> np.ndarray:
+        """抽一次通道幅相误差 Γ，并施加规范（去掉不可辨识的线性相位斜坡）。
+
+        一次抽样 = 幅度照 `_draw_gamma_raw` 抽、相位照抽之后过
+        `apply_phase_gauge`。规范只改相位、不动幅度，也不多消耗随机数，因此：
+
+        * `sigma_g == sigma_phi == 0` 时仍是"全 1、零随机消耗"，历史数据逐位不变；
+        * `sigma_phi == 0`（只开增益误差）时相位全零，去斜坡是恒等变换，数据同样
+          逐位不变 —— 这就是为什么 gain 场景的历史缓存与权重仍然有效；
+        * 只有 `sigma_phi > 0` 的点数据会变，必须重新生成。
+
+        两条路径（`shared_array_mismatch` 的 per-sample state、以及每信源各抽一次的
+        旧路径）都经由本函数取 Γ，所以规范对两者同时生效，不存在一条路径漏掉。
+
+        Returns:
+            np.ndarray: shape (N,) 的 complex128 复增益，相位已去线性斜坡
+            （零均值、零斜率，标准差 0.8657*sigma_phi）。
+        """
+        gamma = self._draw_gamma_raw()
+        if float(self.params.phase_err_std_deg) == 0.0:
+            return gamma
+        return (
+            np.abs(gamma) * np.exp(1j * apply_phase_gauge(np.angle(gamma)))
+        ).astype(np.complex128)
 
     def _draw_mismatch_state(self) -> "ArrayMismatchState":
         """抽一次阵列级失配（位置 + 幅相），装进 `ArrayMismatchState`。

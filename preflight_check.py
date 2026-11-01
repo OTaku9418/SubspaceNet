@@ -605,7 +605,10 @@ def _gamma_statistics_and_sharing():
     # σφ/√n = 5/179 ≈ 0.03°，所以均值的容差必须是 0.2° 量级，不能和 std 共用 0.02。
     np.random.seed(2024)
     sam = Samples(params)
-    draws = np.stack([sam._draw_gamma() for _ in range(4000)])
+    # 这里查的是**文献原式**（Fang Eq.63/64），所以打 `_draw_gamma_raw` 而不是
+    # `_draw_gamma` —— 后者会顺手去掉不可辨识的相位斜坡，std 会缩成 sqrt((N-2)/N) 倍。
+    # 规范那一步由下面 `_gamma_phase_gauge` 单独守。
+    draws = np.stack([sam._draw_gamma_raw() for _ in range(4000)])
     gains = np.abs(draws).ravel()
     phases = np.rad2deg(np.angle(draws)).ravel()
     worst = 0.0
@@ -634,6 +637,97 @@ def _gamma_statistics_and_sharing():
 
     return (f"σg={sigma_g} σφ={sigma_phi_deg}°: std|g|={gains.std():.4f} "
             f"stdφ={phases.std():.3f}° |g-1|≤{span:.4f}；跨信源 Γ 差 {spread:.1e}")
+
+
+@check("通道幅相误差 Γ：相位规范后斜坡与截距归零，只留标准差的 sqrt((N-2)/N) 缩水")
+def _gamma_phase_gauge():
+    """文档 §17.10：ULA 上"逐阵元线性相位斜坡"与"DoA 整体平移"不可区分。
+
+    导向矢量是 Vandermonde 的，`diag{exp(-j·2π·(d/λ)·m·δ)} @ A(θ) == A(θ')`，
+    `sin(θ') = sin(θ) + δ`。所以 Γ 里的整条直线（截距+斜率）从数据里根本看不出来，
+    不约束掉就会把一份与算法无关的误差混进 RMSPE（N=8、σφ=40° 时折合 2.18° rms）。
+    这项检查守三件事：斜坡与截距都归零、幅度不动、σφ=0 时是恒等变换（历史数据不变）。
+    """
+    import numpy as np
+
+    from src.signal_creation import Samples
+    from src.system_model import SystemModelParams, apply_phase_gauge
+
+    n, sigma_g, sigma_phi_deg = 8, 0.05, 20.0
+    params = (
+        SystemModelParams()
+        .set_parameter("N", n)
+        .set_parameter("M", 2)
+        .set_parameter("T", 100)
+        .set_parameter("snr", 10)
+        .set_parameter("eta", 0.0)
+        .set_parameter("bias", 0.0)
+        .set_parameter("sv_noise_var", 0.0)
+        .set_parameter("gain_err_std", sigma_g)
+        .set_parameter("phase_err_std_deg", sigma_phi_deg)
+    )
+
+    np.random.seed(7)
+    sam = Samples(params)
+    raw = np.stack([sam._draw_gamma_raw() for _ in range(2000)])
+    gauged = np.stack([sam._draw_gamma() for _ in range(2000)])
+
+    # --- 幅度不动：Γ 的模长与相位规范无关 ---
+    gain_dev = float(np.abs(np.abs(gauged) - np.abs(raw)).max())
+
+    # --- 斜坡与截距归零 ---
+    phi_deg = np.rad2deg(np.angle(gauged))
+    idx = np.arange(n, dtype=float)
+    centered = idx - idx.mean()
+    slope = (phi_deg @ centered) / (centered @ centered)
+    slope_max = float(np.abs(slope).max())
+    mean_max = float(np.abs(phi_deg.mean(axis=-1)).max())
+    assert slope_max < 1e-9, f"规范后仍有残余斜率 {slope_max:.3e}°"
+    assert mean_max < 1e-9, f"规范后仍有残余截距 {mean_max:.3e}°"
+
+    # --- 只缩水 sqrt((N-2)/N)，没有重标定 ---
+    ratio = float(phi_deg.std() / sigma_phi_deg)
+    want_ratio = float(np.sqrt((n - 2) / n))
+    assert abs(ratio - want_ratio) < 0.02, (
+        f"规范后 stdφ/σφ = {ratio:.4f}，应约 {want_ratio:.4f}"
+    )
+
+    # --- 同一个物理阵列加不同斜坡，规范后必须落回同一个 Γ ---
+    ramp = np.deg2rad(12.0) * (2.0 + 0.5 * idx)
+    base = np.angle(raw[0])
+    tilted = base + ramp
+    same = float(np.abs(apply_phase_gauge(tilted) - apply_phase_gauge(base)).max())
+    assert same < 1e-12, f"加斜坡后规范结果不一致（最大差 {same:.3e}）"
+    assert float(np.abs(tilted - base).max()) > 0.1, "斜坡没加进去，这项检查什么都没测到"
+
+    # --- σφ=0 时是恒等变换（gain 场景的历史缓存因此仍然有效）---
+    params_off = (
+        SystemModelParams()
+        .set_parameter("N", n)
+        .set_parameter("M", 2)
+        .set_parameter("T", 100)
+        .set_parameter("snr", 10)
+        .set_parameter("eta", 0.0)
+        .set_parameter("bias", 0.0)
+        .set_parameter("sv_noise_var", 0.0)
+        .set_parameter("gain_err_std", sigma_g)
+        .set_parameter("phase_err_std_deg", 0.0)
+    )
+    sam_off = Samples(params_off)
+    bit_dev = 0.0
+    for index in range(200):
+        # 必须用同一个种子各抽一次：`_draw_gamma` 内部会再调 `_draw_gamma_raw`，
+        # 连着调两次拿到的是两份不同的抽样，比出来的差异与规范无关。
+        np.random.seed(1000 + index)
+        a = sam_off._draw_gamma_raw()
+        np.random.seed(1000 + index)
+        b = sam_off._draw_gamma()
+        bit_dev = max(bit_dev, float(np.abs(a - b).max()))
+    assert bit_dev == 0.0, f"σφ=0 时规范不是恒等变换（最大差 {bit_dev:.3e}）"
+
+    return (f"N={n} σφ={sigma_phi_deg}°: 残余斜率 {slope_max:.1e}° 截距 {mean_max:.1e}° "
+            f"stdφ/σφ={ratio:.4f}（理论 {want_ratio:.4f}）幅度差 {gain_dev:.1e} "
+            f"加斜坡不变 {same:.1e}")
 
 
 @check("RMSPELoss 的批量实现与逐样本原始实现等价（loss 与梯度）")

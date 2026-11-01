@@ -17,6 +17,7 @@ from src.system_model import (
     ArrayMismatchState,
     SystemModel,
     SystemModelParams,
+    apply_phase_gauge,
     mismatch_suffix,
 )
 
@@ -90,17 +91,21 @@ def test_zero_params_do_not_touch_rng():
 
 # --------------------------------------------------------------------------- #
 # 2 + 3. 生成器统计量与取值范围
+#
+# 分两层测：`_draw_gamma_raw` 必须与文献 Eq.(63)(64) 逐字一致（这一层守住"我们
+# 确实照文献生成"），`_draw_gamma` 必须在其上把不可辨识的线性相位斜坡投影掉
+# （这一层守住"数据是良定的"）。合成一条测试会让两者互相掩盖。
 # --------------------------------------------------------------------------- #
 @pytest.mark.parametrize(
     "sigma_g, sigma_phi_deg",
     [(0.05, 0.0), (0.0, 5.0), (0.1, 15.0), (0.05, 5.0)],
 )
-def test_generator_statistics_and_range(sigma_g, sigma_phi_deg):
+def test_raw_generator_statistics_and_range(sigma_g, sigma_phi_deg):
     np.random.seed(1234)
     model = make_model(gain_err_std=sigma_g, phase_err_std_deg=sigma_phi_deg)
 
     draws = 20000
-    gamma = np.stack([model._draw_gamma() for _ in range(draws)])  # (draws, N)
+    gamma = np.stack([model._draw_gamma_raw() for _ in range(draws)])  # (draws, N)
     gains = np.abs(gamma).ravel()
     phases_deg = np.rad2deg(np.angle(gamma)).ravel()
 
@@ -120,6 +125,54 @@ def test_generator_statistics_and_range(sigma_g, sigma_phi_deg):
         assert np.abs(phases_deg).max() <= np.sqrt(3.0) * sigma_phi_deg + 1e-9
     else:
         assert np.all(phases_deg == 0.0)
+
+
+def test_phase_gauge_kills_the_ramp_and_keeps_the_gain():
+    """规范只吃相位：斜坡归零、首元素归零、幅度一位不变、不放宽也不重标定。"""
+    sigma_g, sigma_phi_deg = 0.1, 15.0
+    np.random.seed(2026)
+    model = make_model(gain_err_std=sigma_g, phase_err_std_deg=sigma_phi_deg)
+
+    draws = 4000
+    raw = np.stack([model._draw_gamma_raw() for _ in range(draws)])
+    np.random.seed(2026)
+    gauged = np.stack([model._draw_gamma() for _ in range(draws)])
+
+    # 幅度分量逐元素不变（规范只改相位）。注意不能要求逐位相等：复增益经过
+    # |γ| → 相位 → 重建 这一圈会引入 ≤1 ulp 的舍入（实测最大 2.2e-16）。
+    np.testing.assert_allclose(np.abs(raw), np.abs(gauged), rtol=0, atol=1e-15)
+
+    phi = np.angle(gauged)
+    idx = np.arange(N, dtype=float)
+    centered = idx - idx.mean()
+    slope = (phi @ centered) / (centered @ centered)
+    # 斜坡必须归零到机器精度
+    assert np.abs(np.rad2deg(slope)).max() < 1e-9
+    # 截距也一并去掉 ⇒ 零均值。这里刻意不额外做"φ₀=0"的锚定：那一步会往每行加一个
+    # 随机常数（全局相位），使下面这个 std 从 0.8657σ 虚高到 1.1538σ。
+    assert np.abs(np.rad2deg(phi).mean()) < 1e-9
+    # 残余标准差按 sqrt((N-2)/N) 缩，不是被重新标定回 σ_φ
+    ratio = np.rad2deg(phi).std() / sigma_phi_deg
+    assert abs(ratio - np.sqrt((N - 2) / N)) < 0.01
+
+    # 直接测工具函数：任意斜坡输入都被投影成一条水平线
+    ramp = np.deg2rad(30.0) * (2.5 + 0.7 * idx)
+    out = apply_phase_gauge(ramp)
+    assert np.abs(out).max() < 1e-12
+    # 二维输入按最后一维逐行处理
+    two = np.stack([ramp, -3.0 * ramp])
+    assert np.abs(apply_phase_gauge(two)).max() < 1e-12
+
+
+def test_phase_gauge_is_identity_when_phase_errors_are_off():
+    """σ_φ=0 时规范必须是恒等变换 —— 这是 gain 场景旧缓存仍然有效的前提。"""
+    np.random.seed(7)
+    model = make_model(gain_err_std=0.2, phase_err_std_deg=0.0)
+    raw = np.stack([model._draw_gamma_raw() for _ in range(200)])
+    np.random.seed(7)
+    gauged = np.stack([model._draw_gamma() for _ in range(200)])
+    np.testing.assert_array_equal(raw, gauged)
+
 
 
 # --------------------------------------------------------------------------- #
