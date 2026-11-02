@@ -181,6 +181,24 @@ SCENARIOS = {
         "folder": "array_mismatch_phase",
         "shared_array_mismatch": True,
     },
+    # 场景 5: 幅相**组合**误差。两个失配旋钮按固定比例绑成一条对角线，
+    # 横轴是归一化严重度 u ∈ [0, 1]，`sigma_g = 0.3u`、`sigma_phi = 40u`。
+    # 比例取成两个单独场景各自网格的失效端（gain 到 0.3、phase 到 40°），
+    # 这样"只增益 / 只相位 / 两者同时"三条曲线可以在同一个 u 上比较 ——
+    # 组合场景要回答的就是"两个失配叠加起来是不是更糟"。
+    # 前 5 个点落在 B/C 档到 A 档的真实区间，后两个点看"两边一起崩"。
+    # 注意 u=0 的文件名与 gain/phase 的 0 点完全相同（都是 _sg=0p0_sphi=0p0_share=1），
+    # 数据也逐位相同，所以那个点直接命中缓存。
+    "gain_phase": {
+        "sweep_param": "severity_u",
+        "grid": [0.0, 0.1, 0.2, 0.35, 0.5, 0.75, 1.0],
+        "train_at": 0.35,
+        "folder": "array_mismatch_gain_phase",
+        "shared_array_mismatch": True,
+        # sweep_param 是虚的（SystemModelParams 里没有 severity_u），
+        # params_for 用这个比例把它换算成 (gain_err_std, phase_err_std_deg)。
+        "pair_scale": (0.3, 40.0),
+    },
 }
 
 
@@ -268,18 +286,49 @@ def make_params(eta: float = 0.0, sv_noise_var: float = 0.0,
     )
 
 
+def pair_for(scenario: str, value: float) -> tuple | None:
+    """组合场景的网格点 -> 它对应的 `(gain_err_std, phase_err_std_deg)` 配对。
+
+    非组合场景返回 None（它们的横轴就是一个真实参数）。
+    """
+    cfg = SCENARIOS[scenario]
+    scale = cfg.get("pair_scale")
+    if scale is None:
+        return None
+    gain_scale, phase_scale = scale
+    return (float(gain_scale) * float(value), float(phase_scale) * float(value))
+
+
 def params_for(scenario: str, value: float) -> SystemModelParams:
     """按"场景名 + 该场景当前扫描值"构造 SystemModelParams。
 
     收口点：`make_params(**{cfg["sweep_param"]: value})` 原先散落在 5 处（训练集、
     测试集、训练、评估、`samples_model`）。场景现在除了扫描参数之外还带自己的
-    非扫描参数（`shared_array_mismatch`），逐处手改迟早漏一处 —— 统一走这里。
+    非扫描参数（`shared_array_mismatch`），逐个手改迟早漏一处 —— 统一走这里。
+
+    组合场景（`gain_phase`）的 `sweep_param` 是虚拟的 `severity_u`：
+    `SystemModelParams` 里没有这个字段，由 `pair_scale` 换算成两个真实旋钮。
     """
     cfg = SCENARIOS[scenario]
+    pair = pair_for(scenario, value)
+    if pair is None:
+        kwargs = {cfg["sweep_param"]: value}
+    else:
+        kwargs = {"gain_err_std": pair[0], "phase_err_std_deg": pair[1]}
     return make_params(
-        **{cfg["sweep_param"]: value},
+        **kwargs,
         shared_array_mismatch=bool(cfg.get("shared_array_mismatch", False)),
     )
+
+
+def level_label(scenario: str, value: float) -> str:
+    """把网格点渲染成一行人话；组合场景顺带把它对应的物理配对写出来。"""
+    sweep = SCENARIOS[scenario]["sweep_param"]
+    pair = pair_for(scenario, value)
+    if pair is None:
+        return f"{sweep}={value}"
+    return (f"{sweep}={float(value):g} "
+            f"(σ_g={100.0 * pair[0]:.1f}%, σ_φ={pair[1]:.1f}°)")
 
 
 def datasets_dir(scenario: str) -> Path:
@@ -314,6 +363,9 @@ SWEEP_LABELS = {
     "sv_noise_var": "steering-vector noise variance ($\\sigma^2_{sv}$)",
     "gain_err_std": "channel gain error std ($\\sigma_g$, linear)",
     "phase_err_std_deg": "channel phase error std ($\\sigma_\\phi$, deg)",
+    # 组合场景的虚拟横轴：u -> (sigma_g, sigma_phi) = u * (0.3, 40 deg)
+    "severity_u": "combined mismatch severity $u$  "
+                  "($\\sigma_g = 0.3u$, $\\sigma_\\phi = 40^\\circ\\!\\cdot u$)",
 }
 # 传给仓库 `plot_spectrum` 的 algorithm 字符串只用来做分派, 但它会先判 "music"
 # (src/plotting.py:62-69)。因此 Root-MUSIC 这一路必须用一个**不含** "music" 子串
@@ -627,8 +679,20 @@ def plot_curve_figures(json_paths, out_dir: Path, metrics=("deg", "ref"),
                                 label=CURVE_LABELS.get(key, key))
                 ax.set_xlabel(SWEEP_LABELS.get(
                     sweep_name, f"array mismatch level ({sweep_name})"))
+                pair_scale = cfg.get("pair_scale")
+                if pair_scale:
+                    # 横轴是归一化严重度 u，刻度上直接把对应的物理配对标出来，
+                    # 否则读图的人不知道 u=0.5 到底是多少幅度/相位误差。
+                    gain_scale, phase_scale = pair_scale
+                    ax.set_xticks(levels)
+                    ax.set_xticklabels(
+                        [f"{float(u):g}\n({100.0 * gain_scale * u:.0f}%, "
+                         f"{phase_scale * u:.0f}°)" for u in levels],
+                        fontsize=8)
                 ax.set_ylabel(ylabel)
-                ax.set_title(f"Fig. 9 reproduction - {scenario} mismatch\n"
+                scenario_title = {"gain_phase": "combined gain + phase"}.get(
+                    scenario, f"{scenario} mismatch")
+                ax.set_title(f"Fig. 9 reproduction - {scenario_title}\n"
                              f"train protocol: {payload.get('train_levels', '?')} | {note}",
                              fontsize=11)
                 ax.legend(fontsize=9)
@@ -697,7 +761,7 @@ def load_or_create_train(scenario: str, value: float, samples: int, force: bool 
         print(f"[train] 复用已存在训练集 {fname}")
         return read_data(path / fname)
 
-    print(f"[train] 生成训练集 {scenario} {cfg['sweep_param']}={value}, n={samples}")
+    print(f"[train] 生成训练集 {scenario} {level_label(scenario, value)}, n={samples}")
     set_unified_seed(42)                          # 固定 seed, 保证可复现
     model_dataset, _, _ = create_dataset(
         system_model_params=params,
@@ -728,7 +792,7 @@ def load_or_create_test(scenario: str, value: float, samples: int, force: bool =
         print(f"[test ] 复用已存在测试集 {tag}")
         return read_data(path / model_f), read_data(path / generic_f)
 
-    print(f"[test ] 生成测试集 {scenario} {cfg['sweep_param']}={value}, n={samples}")
+    print(f"[test ] 生成测试集 {scenario} {level_label(scenario, value)}, n={samples}")
     set_unified_seed(1234)                        # 所有失配水平共用同一 seed
     model_dataset, generic_dataset, samples_model = create_dataset(
         system_model_params=params,
@@ -1053,8 +1117,9 @@ def run(scenario: str, args):
         print(f"[协议] 逐点匹配: 网格上每个 {sweep} 各训练一个模型 (忠实复现 Fig.9)")
     else:
         fixed_at = args.train_at if args.train_at is not None else cfg["train_at"]
-        print(f"[协议] 单一模型: 仅在 {sweep}={fixed_at} 训练, 在整个网格上评估 (鲁棒性消融)")
-    if sweep == "phase_err_std_deg" and any(float(v) > 0.0 for v in grid):
+        print(f"[协议] 单一模型: 仅在 {level_label(scenario, fixed_at)} 训练, "
+              f"在整个网格上评估 (鲁棒性消融)")
+    if any(params_for(scenario, v).phase_err_std_deg > 0.0 for v in grid):
         # 文档 §17.10: 相位里那条直线(截距+斜率)在 ULA 上等价于 DoA 平移, 不可辨识.
         # 规范之后 sigma_phi != 0 的数据会变, 而缓存文件名没跟着变(见 §17.4 的取舍),
         # 所以必须在启动时把这件事喊出来, 否则会拿旧数据跑出互相矛盾的两条曲线.
@@ -1090,12 +1155,18 @@ def run(scenario: str, args):
                "train_at": train_at,
                "matched": bool(matched or train_at == value),
                "method_used": ckpt.name}
+        # 组合/对角场景的横轴是虚拟量 u，把换算出来的物理配对一并记进结果行，
+        # 这样 JSON 自描述 —— 以后翻数据不用回去查 pair_scale 才能复原 σ_g / σ_φ。
+        _pair = pair_for(scenario, value)
+        if _pair is not None:
+            row["gain_err_std"] = round(_pair[0], 6)
+            row["phase_err_std_deg"] = round(_pair[1], 6)
         for k, v in res.items():
             row[f"{k}_ref"] = round(v["rmspe_ref"], 4)
             row[f"{k}_deg"] = round(v["rmspe_deg"], 4)
             row[f"{k}_fail"] = round(v["fail_rate"], 4)
         rows.append(row)
-        print(f"  {sweep}={value} (train_at={train_at}): " + " | ".join(
+        print(f"  {level_label(scenario, value)} (train_at={train_at:g}): " + " | ".join(
             f"{k}={v['rmspe_deg']:.3f}°" for k, v in res.items()))
 
         # 每个失配水平评估完立刻出「谱图 / 特征值分离图」(PNG)

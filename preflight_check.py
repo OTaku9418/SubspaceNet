@@ -730,6 +730,69 @@ def _gamma_phase_gauge():
             f"加斜坡不变 {same:.1e}")
 
 
+@check("组合失配：幅度与相位误差同时进到数据里，且相位已去斜坡")
+def _combined_mismatch_composes_both():
+    """文档 §17.11：`gain_phase` 场景用一条对角线同时开两个旋钮。
+
+    这条对角线靠 `SCENARIOS["gain_phase"]["pair_scale"]` 把 u 换算成
+    `(σ_g, σ_φ)`（换算本身由 `tests/test_scenarios.py` 逐点守）。这里守的是**另一半**：
+    两个参数同时非零时，生成出来的 Γ 真的同时带了幅度误差和相位误差，而且相位仍然
+    是去过斜坡的（否则组合场景会偷偷把 §17.10 修掉的那段不可辨识相位又放回来）。
+    """
+    import numpy as np
+
+    from src.signal_creation import Samples
+    from src.system_model import SystemModelParams
+
+    sigma_g, sigma_phi_deg = 0.15, 20.0        # 组合场景 u = 0.5 那一档
+    params = (
+        SystemModelParams()
+        .set_parameter("N", 8)
+        .set_parameter("M", 2)
+        .set_parameter("T", 100)
+        .set_parameter("snr", 10)
+        .set_parameter("eta", 0.0)
+        .set_parameter("bias", 0.0)
+        .set_parameter("sv_noise_var", 0.0)
+        .set_parameter("gain_err_std", sigma_g)
+        .set_parameter("phase_err_std_deg", sigma_phi_deg)
+        .set_parameter("shared_array_mismatch", True)   # 组合场景的口径
+    )
+    np.random.seed(31)
+    sam = Samples(params)
+    sam.set_doa([-20.0, 30.0])
+    _samples, _signal, A, _noise = sam.samples_creation()
+
+    # 用"除以标称导向矢量"的办法把 Γ 从流形里除出来（两个信源各除一次）
+    ratios = [
+        A[:, column] / sam.steering_vec(theta, nominal=True)
+        for column, theta in enumerate(sam.doa)
+    ]
+    gamma = ratios[0]
+
+    # 1) 幅度误差真的在（不是悄悄退化成 1）
+    gain_dev = float(np.abs(np.abs(gamma) - 1.0).max())
+    assert gain_dev > 0.01, f"幅度误差没进数据（|Γ| 偏离 1 只有 {gain_dev:.2e}）"
+    # 2) 相位误差真的在
+    phase = np.rad2deg(np.angle(gamma))
+    phase_dev = float(np.abs(phase).max())
+    assert phase_dev > 1.0, f"相位误差没进数据（|∠Γ| 最大只有 {phase_dev:.3f}°）"
+    # 3) 且相位是去过斜坡的（零均值零斜率）
+    idx = np.arange(params.N, dtype=float)
+    centered = idx - idx.mean()
+    slope = float((phase @ centered) / (centered @ centered))
+    mean = float(phase.mean())
+    assert abs(slope) < 1e-9, f"组合场景的相位还留着斜坡（斜率 {slope:.3e}°）"
+    assert abs(mean) < 1e-9, f"组合场景的相位没去截距（均值 {mean:.3e}°）"
+    # 4) 两个信源共用同一副阵列
+    spread = float(np.abs(ratios[0] - ratios[1]).max())
+    assert spread < 1e-12, f"两个信源除出来的 Γ 不同（最大差 {spread:.3e}）"
+
+    return (f"σg={sigma_g} σφ={sigma_phi_deg}°: |Γ|-1 最大 {gain_dev:.3f}、"
+            f"∠Γ 最大 {phase_dev:.1f}°、残余斜率 {slope:.1e}° 均值 {mean:.1e}°、"
+            f"跨信源差 {spread:.1e}")
+
+
 @check("RMSPELoss 的批量实现与逐样本原始实现等价（loss 与梯度）")
 def _rmspe_loss_equivalence():
     """src/criterions.py 的 RMSPELoss.forward 原本是逐样本 + 逐排列的循环（文档 §16.13）。
