@@ -316,12 +316,12 @@ SUBSPACENET_DATA_ROOT=/data/subspacenet python reproduce_array_mismatch.py all -
 
 ### 7.1 上全量之前先跑环境自检
 
-同目录下的 `preflight_check.py` 用 **~1 分钟、只读、不留垃圾**的方式验证 26 项前置条件，
+同目录下的 `preflight_check.py` 用 **~1 分钟、只读、不留垃圾**的方式验证 27 项前置条件，
 任何 `[FAIL]` 都意味着全量跑（数小时）会失败或结论无效：
 
 ```bash
-python preflight_check.py          # 25 项静态+轻量检查（跳过真实训练冒烟）
-python preflight_check.py --full   # 26 项，额外做一次真实训练冒烟（约 1 分钟）
+python preflight_check.py          # 26 项静态+轻量检查（跳过真实训练冒烟）
+python preflight_check.py --full   # 27 项，额外做一次真实训练冒烟（约 1 分钟）
 ```
 
 覆盖内容：Python/依赖版本、**CUDA 可用性**（`src/utils.py:32` 的 `device` 在 import 时定型，
@@ -521,8 +521,8 @@ REFERENCES                            ← 直接结束，无附录
 
 - [ ] 用极小数据跑通一次并得到四行结果：`--n_train 40 --n_test 20 --epochs 1 --batch_size 8 --limit 20`（§13.5 有预期形状）
 - [ ] 评估侧给了 `--eval_batch 512`（否则 SubspaceNet 前向会按算法重算 3 遍；经典 MUSIC 的 18000 点网格不受它影响，见 §16.16）
-- [ ] `python preflight_check.py` 全绿（25 项：依赖/CUDA 真算一次/参数量 41761/RMSPE 口径 π/180/nominal 导向矢量/MUSIC 出数/数据管线/失配注入/DoA 可比性/六处批量实现的等价性/判据函数的设备跟随/评估分批一致性/Γ 的零消耗与跨信源共享/Γ 的相位规范）
-- [ ] 需要连训练路径一起验时加 `--full`（26 项，约 1 分钟）
+- [ ] `python preflight_check.py` 全绿（26 项：依赖/CUDA 真算一次/参数量 41761/RMSPE 口径 π/180/nominal 导向矢量/MUSIC 出数/数据管线/失配注入/DoA 可比性/六处批量实现的等价性/判据函数的设备跟随/评估分批一致性/Γ 的零消耗与跨信源共享/Γ 的相位规范/组合失配的两个旋钮同时生效）
+- [ ] 需要连训练路径一起验时加 `--full`（27 项，约 1 分钟）
 
 **出图（PNG，见 §14）**
 
@@ -659,7 +659,7 @@ return predictions, response_curve     # src/methods.py:657-658
 - `--capture` 存 `params` 时若直接 `np.savez(dict)`，读回会撞 `ValueError: Object arrays cannot be loaded when allow_pickle=False`。**注意 `np.load` 是惰性的**——错误要到你真正取那个数组时才抛，所以 `try/except` 包住 `np.load` 本身没用，必须把数组全部取出来。现在存的是 JSON 字符串，并且 `_load_capture` 会为旧 npz 回退到 `allow_pickle=True`。
 - `RootMUSIC.narrowband` 返回的 `roots`（`src/methods.py:475-486`）是**全部 N 个根**（按到单位圆的距离排序），而 `doa_predictions` 只取单位圆内的前 M 个（`roots_inside = [root for root in roots if ((abs(root)-1) < 0)][:M]`）。画根图若按 `roots[:len(predictions)]` 取，会拿到半径 >1 的根。
 
-> 自检小抄：`python preflight_check.py` 全绿（25 项，见 §7.1），或 `python reproduce_array_mismatch.py all --scenario spacing --n_train 40 --n_test 20 --epochs 1 --batch_size 8 --limit 20` 能在 1–2 分钟内跑出上面这种形状的四行输出，说明**环境、依赖、CUDA、数据管线、三算法、指标口径**全部就绪，可以放心上全量了。
+> 自检小抄：`python preflight_check.py` 全绿（26 项，见 §7.1），或 `python reproduce_array_mismatch.py all --scenario spacing --n_train 40 --n_test 20 --epochs 1 --batch_size 8 --limit 20` 能在 1–2 分钟内跑出上面这种形状的四行输出，说明**环境、依赖、CUDA、数据管线、三算法、指标口径**全部就绪，可以放心上全量了。
 
 ---
 
@@ -840,7 +840,7 @@ python preflight_check.py --full
 
 这么改的用意：把这类错误**从"跑到第 3 项才炸、且报错位置随机"提前到第 1 组、并且直接给出结论**。第 1 组还会先做复数 `matmul` 与 `linalg.eig`——这正是 SubspaceNet 推理最依赖、也最容易撞 sm 问题的两个算子。
 
-（自检本身也在长：最近几轮陆续加了四处批量实现的等价性回归、以及判据函数的设备跟随检查，现在 `--full` 是 **26 项 / 0 FAIL**，见 §7.1。）
+（自检本身也在长：最近几轮陆续加了四处批量实现的等价性回归、以及判据函数的设备跟随检查，现在 `--full` 是 **27 项 / 0 FAIL**，见 §7.1。）
 
 ### 15.5 换 torch 版本的兼容性提醒（本项目特有）
 
@@ -1568,7 +1568,7 @@ Step B 的 `state` 路径零消耗、`samples_creation` 在 Step B 下跨信源�
        σg=0.1 σφ=5.0°: std|g|=0.1000 stdφ=5.000° |g-1|≤0.1732；跨信源 Γ 差 0.0e+00
 ```
 
-⇒ `python preflight_check.py` 现在是 **PASS=25 FAIL=0 SKIP=1**（`--full` 再加一条训练冒烟，
+⇒ `python preflight_check.py` 现在是 **PASS=26 FAIL=0 SKIP=1**（`--full` 再加一条训练冒烟，
 约 1 分钟）。
 
 一处容差踩坑：`mean φ` 的标准误是 `σ_φ/√n = 5/179 ≈ 0.03°`，所以它的容差必须是 0.2°
@@ -1691,7 +1691,7 @@ phase 场景的旧数据与旧权重**（`data/datasets/array_mismatch_phase/`�
 `data/weights/array_mismatch/phase_*`），否则新旧混在一条曲线上。脚本启动时会对
 phase 场景打印一次提醒，结果 JSON 里也记了 `"phase_gauge": "ramp"` 便于事后分辨。
 
-**验证**（`python -m pytest tests -q` → 17 passed；`python preflight_check.py` → PASS=25
+**验证**（`python -m pytest tests -q` → 22 passed；`python preflight_check.py` → PASS=26
 FAIL=0 SKIP=1）：
 
 - 规范后残余斜率 < 1e-9°、截距 < 1e-9°；
@@ -1704,3 +1704,100 @@ FAIL=0 SKIP=1）：
 门槛是 `σ_a² > 1/(N·SNR)`，T=100、SNR=10 dB 时即 RGEA 3.2% / PEA 1.8°，再往上才是
 真正的失配效应；Fang 用的 σ_ρ=0.2、σ_φ=40° 是稀疏阵 + 3 源的极端档。本实验的结论区间
 建议落在 **σ_g ≤ 0.1、σ_φ ≤ 20°**，grid 右端保留 0.3 / 40° 只作为"两边一起崩"的边界参考。
+
+### 17.11 组合场景：幅度与相位同时错
+
+**为什么加这个场景**。论文 Fig. 9 把失配拆成两个单独的场景（间距、导向矢量加噪），
+§17 又按同一逻辑拆出增益、相位两张图。但实际阵列上这两类误差是**同时**存在的：
+校准之后仍然会剩下一点幅度残差和一点相位残差。分开测只能回答"各自有多糟"，回答不了
+"两个叠加是不是更糟"。这个场景补的就是这一格。
+
+**设计：一条对角线，不是整个平面**。二维网格（σ_g × σ_φ 各 5–6 档 = 25–36 个点）
+信息最全，但每点一个模型就是 25 个模型、4 小时以上，而且现有的
+`plot_curve_figures` 只画一维曲线，还得另写热图。所以这里把两个旋钮按固定比例绑成
+一条对角线，横轴取归一化严重度 `u ∈ [0, 1]`：
+
+```
+sigma_g  = 0.3  * u          (线性比值, 0.3 = 30%)
+sigma_phi = 40.0 * u         (度)
+```
+
+比例不是拍脑袋：**两个端点正好是两个单独场景各自网格的失效端**（gain 到 0.3、
+phase 到 40°）。这样"只增益 / 只相位 / 两者同时"三条曲线能落在同一个横轴上比较 ——
+这才是加这个场景的意义。代价是横轴变成无量纲的 u，物理量得靠刻度标签读，
+所以图上每个刻度都标了配对 `(σ_g, σ_φ)`。
+
+网格（7 个点，`matched` 协议 = 7 个模型）：
+
+| u | σ_g | σ_φ | 对应档位 |
+|---|---|---|---|
+| 0.00 | 0 | 0° | 完全校准（与 gain/phase 的 0 点是同一套参数）|
+| 0.10 | 3% | 4° | B 档（未逐通道校准，0.5 dB / 4°）|
+| 0.20 | 6% | 8° | B 档偏重 |
+| 0.35 | 10.5% | 14° | A 档（宽公差）|
+| 0.50 | 15% | 20° | A 档上限 |
+| 0.75 | 22.5% | 30° | 重度（Guo 2022 量级）|
+| 1.00 | 30% | 40° | 两边一起崩（Fang 2026 的重度档）|
+
+**实现**。`sweep_param` 是**虚拟**的 `severity_u`（`SystemModelParams` 里没有这个
+字段），场景字典里多一个 `pair_scale: (0.3, 40.0)`：
+
+```python
+def pair_for(scenario, value):          # 网格点 -> (gain_err_std, phase_err_std_deg)
+    scale = SCENARIOS[scenario].get("pair_scale")
+    if scale is None:
+        return None                     # 非组合场景：横轴就是一个真实参数
+    return (scale[0] * value, scale[1] * value)
+
+def params_for(scenario, value):
+    pair = pair_for(scenario, value)
+    kwargs = {cfg["sweep_param"]: value} if pair is None else {
+        "gain_err_std": pair[0], "phase_err_std_deg": pair[1]}
+    ...
+```
+
+`params_for` 仍然是**唯一**的收口点（5 处调用一处没动），所以组合场景不需要在训练、
+评估、`samples_model` 任何一处加分支。结果行里同时记 `severity_u`、
+`gain_err_std`、`phase_err_std_deg` 三列 —— JSON 自描述，以后翻数据不必回去查
+`pair_scale` 才能复原两个物理量。日志与图里的标签走 `level_label()`，会渲染成
+`severity_u=0.35 (σ_g=10.5%, σ_φ=14.0°)`。
+
+**缓存**。`gain_phase` 的 u=0 与 gain@0、phase@0 是**同一套失配参数**
+（σ_g=0、σ_φ=0、share=1），数据逐位相同，`mismatch_suffix` 也给出同一个
+`_sg=0p0_sphi=0p0_share=1`。但**脚本自己的 `.pt` 缓存名带场景名与虚拟轴名**
+（`SubspaceNet_DataSet_gain_phase_severity_u=0p0_n45000.pt`），所以它**不会**自动
+命中那两个场景已经生成好的文件，会重新生成一份（约 50 s + 10 s）。这是名字分层的
+结果，不是 bug；真要省这 1 分钟，把那份文件复制改名即可，但没必要。
+
+**出图**。只出组合场景自己的 6 线图（`fig9_gain_phase_deg.png` /
+`fig9_gain_phase_ref.png`），横轴 u、刻度标配对、标题为
+"combined gain + phase"。**没做**跨 JSON 的合并对比图（把三条曲线按 u 叠在一起）：
+那需要另写一个读多份 JSON 的绘图函数，而单看这张图已经能回答"组合之后掉到哪"。
+如果以后要做，把 gain 的 `σ_g/0.3`、phase 的 `σ_φ/40`、组合的 `u` 各自归一化即可，
+三条 `SubNet+r-music` 曲线能直接叠。
+
+**怎么读这张图**。看两条线的间距随 u 怎么变：若组合曲线与两个单误差曲线几乎重合，
+说明误差在效果上**可加**（各自的损伤互不相干）；若组合明显更差，说明两者**互相放大**
+（例如幅度误差压低了有效 SNR、相位误差又破坏了子空间正交性）。同时盯住
+`SubNet+music` 那一条 —— 它在前两个场景里都表现为"与失配强度几乎无关的常数偏差"，
+如果组合场景里仍然如此，那更能确认问题出在评估路径而不是失配建模。
+
+**验证**。`python -m pytest tests -q` → **22 passed**（新增
+`tests/test_scenarios.py` 五条：逐点的 u→(σ_g,σ_φ) 映射、原有四场景不受影响、
+u=0 与 gain/phase 的零点是同一套参数、每个网格点的 `mismatch_suffix` 互不相同、
+`level_label` 渲染出物理配对）；`python preflight_check.py` → **PASS=26 FAIL=0 SKIP=1**，
+其中新增的"组合失配：幅度与相位误差同时进到数据里，且相位已去斜坡"用真实
+`samples_creation()` 把 Γ 从流形里除出来，断言 `|Γ|-1` 与 `∠Γ` 都显著非零、且相位
+仍然零均值零斜率（防止组合场景把 §17.10 修掉的那段不可辨认相位又放回来）。
+
+**怎么跑**。服务器上（单卡约 1 小时）：
+
+```bash
+python reproduce_array_mismatch.py all --scenario gain_phase --device 1
+```
+
+想先 10 分钟看形状就用单一模型协议（`train_at` 默认 0.35，即 σ_g=10.5% / σ_φ=14°）：
+
+```bash
+python reproduce_array_mismatch.py all --scenario gain_phase --train_levels single --device 1
+```
