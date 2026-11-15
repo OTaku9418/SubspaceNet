@@ -1801,3 +1801,156 @@ python reproduce_array_mismatch.py all --scenario gain_phase --device 1
 ```bash
 python reproduce_array_mismatch.py all --scenario gain_phase --train_levels single --device 1
 ```
+
+## 18. 残差臂：两条加法恒等跳连（`--arch res`）
+
+> 任务书在 `docs/plan_residual_network_2026-11-15.md`（`docs/*` 被忽略，只在本地）。
+> 本节记录：加什么、为什么这么加、怎么证明"只加了拓扑"，以及单一颗种子的实测。
+
+### 18.1 加什么
+
+基线的编码器与解码器其实是对称的（`conv1/2/3` 把 8×16×8 压到 128×13×5，`deconv2/3/4`
+再放回去），但编码器的特征到不了解码器。补两条 strict ResNet 的加法恒等跳连：
+
+```
+x1 = AReLU(conv1(Rx_tau))        (B, 32, 15, 7)
+x2 = AReLU(conv2(x1))            (B, 64, 14, 6)
+x3 = AReLU(conv3(x2))            (B,128, 13, 5)
+y2 = AReLU(deconv2(x3)) + x2     (B, 64, 14, 6)   <- 跳连 1
+y1 = AReLU(deconv3(y2)) + x1     (B, 32, 15, 7)   <- 跳连 2
+Rx = deconv4(DropOut(y1))        (B,  1, 16, 8)
+```
+
+两个接缝的通道与尺寸天然相等（`kernel_size=2`、stride 1，反卷积正好 +1），所以改动的
+性质很干净：
+
+- **零新增参数**：两臂都是 41761；
+- **不改层形状**：12 个 `state_dict` 键同名同形，11-02 的旧权重可以 `strict=True` 直接
+  加载进残差臂，`skip_scale=0` 时输出逐位相同；
+- **不新增权重**：`skip_scale` 是类属性（默认 1.0），不进 `state_dict`。"拓扑"与"是否启用
+  跳连"因此是两个独立开关，消融不需要重训。
+
+### 18.2 代码在哪
+
+| 文件 | 改动 |
+|---|---|
+| `src/models_residual.py` | 新增 `SubspaceNetResidual(SubspaceNet)`；只重写 `forward`，尾段（复数重建 + Gram + 对角加载 + 可微 Root-MUSIC）**逐字复制** |
+| `src/models.py` | `ModelGenerator.set_model` 加 9 行 `elif startswith("SubspaceNetResidual")`，函数内懒加载 import，分支排在 `SubspaceNet` 之前 |
+| `tests/test_residual_arch.py` | 新增 4 条 |
+| `preflight_check.py` | 新增 1 条体检 |
+
+尾段复制而不抽公共函数，是刻意的：`skip_scale=0` 的逐位等价测试要证明"两份独立实现给出
+同一结果"。若两边共用尾段，测试退化成自证——尾段改坏时两边一起坏，测试反而测不出来。
+
+分派必须用 `startswith("SubspaceNetResidual")` 且排在 `SubspaceNet` 之前，否则会被前缀
+吃掉。类名保留 `SubspaceNet` 前缀是刚需：`src/data_handler.py:111` 与
+`src/evaluation.py:104` 都靠这个前缀分流模型类型。
+
+### 18.3 顺手修掉的种子问题（计划 §5.2 的前提不成立）
+
+计划说"两臂同 seed 同初始化"，但 `train_one` 从不设种子：`set_unified_seed` 只在数据
+生成路径上（`reproduce_array_mismatch.py:779` seed 42、`:810` seed 1234），缓存命中时
+根本不执行。于是两臂的初始权重取决于进程启动时的 RNG 状态——A/B 实际是"两个随机种子"
+的对比，会混进计划自己在 §5.2 量到的 21% 噪声。
+
+现在 `train_one` 在建模型之前先 `set_unified_seed(INIT_SEED=1234)`：初始权重、dropout
+掩码、DataLoader 的洗牌顺序一起锁死（`torch.manual_seed` 对 CPU 与 CUDA 生成器都生效，
+实测 `cuda randn` 与 `cuda dropout mask` 逐位一致）。`init_seed` 写进结果 JSON 的
+`config`。这只消掉"初始化"一项随机性：两臂损失面不同，训练轨迹从第一步就分叉，所以仍然
+不是配对检验。
+
+### 18.4 怎么证明"只加了拓扑"
+
+四条测试加一条体检，核心是第 3、4 条：
+
+1. 两臂参数量都是 **41761**；
+2. 两臂 `state_dict` 键名/形状逐字相同，且 `skip_scale` 不在键里；
+3. `skip_scale=0` 时，`Rz`、`doa_prediction`、`doa_all_predictions`、`roots` 与基线
+   **逐位相等**（复数先 `view_as_real`，再用 `view(torch.int32)` 比较）；
+4. 同一个逐位比较在 `skip_scale=1` 时必须**不相等**，否则说明跳连根本没接上；
+5. 工厂分派：`set_model_type("SubspaceNetResidual")` 拿到残差类，`"SubspaceNet"` 仍拿到
+   基线。
+
+当前：`python -m pytest tests -q` → **26 passed**；`python preflight_check.py --full` →
+**PASS=28 FAIL=0**（含一次 2 epoch 的真实训练冒烟）。
+
+### 18.5 实测
+
+协议与 11-02 的 matched 跑法一致：45000 训练 / 5000 测试 / 80 epoch / batch 1024 /
+单种子 1234，gain_phase 的 7 个网格点逐点各训一个模型。本机 RTX 4060 Laptop，单臂约
+75 分钟。
+
+| u | 配对 (σ_g, σ_φ) | base | res | 提升 | Root-MUSIC |
+|---:|---|---:|---:|---:|---:|
+| 0.0 | 0%, 0° | 0.3243 | 0.3502 | -8.0% | 0.1235 |
+| 0.1 | 3%, 4° | 0.4412 | 0.4579 | -3.8% | 0.4226 |
+| 0.2 | 6%, 8° | 0.5054 | 0.4703 | +6.9% | 0.7507 |
+| 0.35 | 10.5%, 14° | 0.6358 | 0.6180 | +2.8% | 1.2067 |
+| 0.5 | 15%, 20° | 0.9340 | 1.0903 | -16.7% | 1.6499 |
+| 0.75 | 22.5%, 30° | 2.1106 | 2.2595 | -7.1% | 2.4470 |
+| 1.0 | 30%, 40° | 4.8463 | 4.9910 | -3.0% | 4.7681 |
+| **均值** | | **1.3997** | **1.4625** | **-4.5%** | **1.6241** |
+
+`提升 = (base - res) / base`，正数表示残差臂更好；均值按网格点算术平均。经典算法
+（Root-MUSIC 那一列）两次评估逐位相同，说明两条臂用的是同一份测试集。
+
+三个算子的均值：
+
+| 算子 | base | res | 相对 |
+|---|---:|---:|---:|
+| SubspaceNet + Root-MUSIC | 1.3997 | 1.4625 | -4.5% |
+| SubspaceNet + ESPRIT | 2.9340 | 2.9328 | +0.0% |
+| SubspaceNet + MUSIC | 3.9551 | 3.5975 | +9.0% |
+
+**读法**。残差臂在 u=0.2 / 0.35 好 7% / 3%，在 u=0.5 差 17%，其余点差 3–8%，均值 -4.5%。
+这个量级落在种子噪声里，能说的只有"**没有可分辨的收益，也没有灾难性退化**"。更敏感的
+`+MUSIC` 分支反而好了 9%，同样没有多种子支撑，不能当成结论。
+
+对照组：今天重训的 base 臂与 11-02 的旧结果（`array_mismatch_gain_phase_20261102_124143.json`）比：
+
+| u | 11-02 | 今天 | 比值 |
+|---:|---:|---:|---:|
+| 0.0 | 0.6063 | 0.3243 | 0.53 |
+| 0.1 | 0.5389 | 0.4412 | 0.82 |
+| 0.2 | 0.5311 | 0.5054 | 0.95 |
+| 0.35 | 0.7456 | 0.6358 | 0.85 |
+| 0.5 | 0.8691 | 0.9340 | 1.07 |
+| 0.75 | 1.6400 | 2.1106 | 1.29 |
+| 1.0 | 4.4538 | 4.8463 | 1.09 |
+| **均值** | **1.3407** | **1.3997** | **1.04** |
+
+逐点 0.53–1.29 倍，均值 1.04 倍。计划 §5.2 记录的同条件三次训练是 0.4067 / 0.4923 /
+0.3481（1.41 倍），今天的漂移在同一个量级——所以 base 臂没有坏；这也再次说明单种子 A/B
+分辨不了 5% 的差异。
+
+图与表（`tools/analysis/plot_residual_comparison.py` 生成，刻意与 fig9 图放在一起）：
+
+```
+data/simulations/figures/residual_ab_gain_phase_deg.png
+data/simulations/figures/residual_ab_gain_phase_deg.md
+```
+
+### 18.6 怎么跑
+
+```bash
+python reproduce_array_mismatch.py all --scenario gain_phase --arch base --device 0 --eval_batch 512 --no_plot
+python reproduce_array_mismatch.py all --scenario gain_phase --arch res  --device 0 --eval_batch 512 --no_plot
+python tools/analysis/plot_residual_comparison.py \
+    --base data/simulations/results/array_mismatch_gain_phase_20261115_143155.json \
+    --res  data/simulations/results/array_mismatch_gain_phase_20261115_154904.json
+```
+
+权重名带臂后缀（`..._base.pt` / `..._res.pt`），两臂不会互相覆盖；`--smoke` 的权重再多
+一层 `_smoke`——`train_one` 对已存在的 ckpt 会直接跳过，不加这层后缀，冒烟写出的 3 epoch
+权重会被后面的全量训练当成"训练好了"复用。
+
+### 18.7 还没做的
+
+- **单种子**。要回答"残差到底有没有用"至少需要 3 个种子，并沿用同一 `init_seed` 设计，
+  让不同种子之间的方差可比。现在这组数只能当"管线通了、没崩"的证据。
+- 只跑了 `gain_phase`。`spacing` 与 `sv_noise_var` 没跑，残差臂在别的失配类型下未必同样
+  中性。
+- 计划决策 #8 写的"StepLR 30 epoch × 0.5"与代码不符：实际 `SCHED_STEP=80`、
+  `SCHED_GAMMA=0.2`（`reproduce_array_mismatch.py:141-142`），80 epoch 内一次都不衰减。
+  这次没改——改了就跟 11-02 不可比；以后要调，两臂必须同时调。
+- `skip_scale` 只做类属性，没有 CLI。消融用测试里的 `skip_scale=0` 即可，不需要重训。
