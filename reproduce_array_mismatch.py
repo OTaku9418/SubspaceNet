@@ -202,6 +202,19 @@ SCENARIOS = {
 }
 
 
+# 结构臂: base = 原论文拓扑, res = 加两条加法恒等跳连 (见 src/models_residual.py).
+# 类名必须以 "SubspaceNet" 开头 —— src/data_handler.py:111 与 src/evaluation.py:104
+# 都靠 startswith("SubspaceNet") 分流; 而 ModelGenerator 里的 Residual 分支必须排在
+# SubspaceNet 分支之前, 否则会被前缀匹配吃掉.
+ARCHS = {"base": "SubspaceNet", "res": "SubspaceNetResidual"}
+
+# 两臂共用的初始化种子: 只在建模型之前设一次, 用来同时锁死初始权重、sklearn 的
+# 训练/验证切分、每个 epoch 的 minibatch 顺序、以及 dropout 掩码
+# (torch.manual_seed 对 CPU 与 CUDA 生成器都生效, 已实测). 不设的话, 缓存命中时
+# 两臂的初始权重取决于进程启动的 RNG 状态 => A/B 会混进 20% 量级的种子噪声.
+INIT_SEED = 1234
+
+
 # ------------------------------------------------------------------------------
 # 指标: 复刻 src/criterions.RMSPE 的置零/补齐约定, 但同时给出有物理意义的版本
 # ------------------------------------------------------------------------------
@@ -693,6 +706,7 @@ def plot_curve_figures(json_paths, out_dir: Path, metrics=("deg", "ref"),
                 scenario_title = {"gain_phase": "combined gain + phase"}.get(
                     scenario, f"{scenario} mismatch")
                 ax.set_title(f"Fig. 9 reproduction - {scenario_title}\n"
+                             f"arch: {payload.get('config', {}).get('arch', 'base')} | "
                              f"train protocol: {payload.get('train_levels', '?')} | {note}",
                              fontsize=11)
                 ax.legend(fontsize=9)
@@ -811,17 +825,24 @@ def load_or_create_test(scenario: str, value: float, samples: int, force: bool =
 # 训练
 # ------------------------------------------------------------------------------
 def train_one(scenario: str, value: float, train_ds, epochs: int, batch_size: int,
-              out_dir: Path, smoke: bool = False):
+              out_dir: Path, smoke: bool = False, arch: str = "base"):
     cfg = SCENARIOS[scenario]
     params = params_for(scenario, value)
+    # 两臂必须从同一初始权重出发: 见 INIT_SEED 的注释. 只在这里设一次种子,
+    # 后面的 optimizer/DataLoader 都从这条随机流里取, 于是两臂的训练轨迹只差拓扑.
+    set_unified_seed(INIT_SEED)
     model_config = (
         ModelGenerator()
-        .set_model_type("SubspaceNet")
+        .set_model_type(ARCHS[arch])
         .set_diff_method("root_music")     # 论文: 训练用可微的 Root-MUSIC
         .set_tau(TAU_LAGS)
         .set_model(params)
     )
+    # 权重名带结构臂后缀 (决策 #7): 旧 tag 不含结构, 两条臂会互相覆盖.
+    # smoke 再加一层后缀: train_one 对已存在的 ckpt 会直接跳过, 冒烟写出的 3-epoch
+    # 权重若和正式跑同名, 后面的全量训练会把它当成"已训练好"而复用.
     tag = f"{scenario}_{cfg['sweep_param']}={value}".replace(".", "p")
+    tag = f"{tag}_{arch}" + ("_smoke" if smoke else "")
     ckpt = out_dir / f"{tag}.pt"
     if ckpt.exists() and not smoke:
         print(f"[model] 权重已存在, 跳过训练: {ckpt.name}")
@@ -873,12 +894,12 @@ def train_one(scenario: str, value: float, train_ds, epochs: int, batch_size: in
 def eval_on_test(scenario: str, value: float, model_test_ds, generic_test_ds,
                  samples_model, ckpt: Path, algorithms: list[str], limit: int = 0,
                  capture_dir: Path | None = None, capture_index: int = 0,
-                 subnet_batch: int = 1):
+                 subnet_batch: int = 1, arch: str = "base"):
     cfg = SCENARIOS[scenario]
     params = params_for(scenario, value)
     # 评估时必须用测试集自己的系统模型 (决定导向矢量/频率)
     model_config = (
-        ModelGenerator().set_model_type("SubspaceNet")
+        ModelGenerator().set_model_type(ARCHS[arch])
         .set_diff_method("root_music").set_tau(TAU_LAGS).set_model(params)
     )
     model = model_config.model
@@ -1112,7 +1133,11 @@ def run(scenario: str, args):
         grid = [float(grid[i]) for i in keep]
         print(f"*** SMOKE: 失配网格缩到 {grid} (完整网格 {full}) ***")
     sweep = cfg["sweep_param"]
+    arch = getattr(args, "arch", "base")
+    if arch not in ARCHS:
+        raise ValueError(f"--arch 只能是 {sorted(ARCHS)}, 收到 {arch!r}")
     matched = args.train_levels == "matched"
+    print(f"[结构] arch={arch} -> {ARCHS[arch]} (初始化种子 {INIT_SEED}, 两臂共用)")
     if matched:
         print(f"[协议] 逐点匹配: 网格上每个 {sweep} 各训练一个模型 (忠实复现 Fig.9)")
     else:
@@ -1138,7 +1163,8 @@ def run(scenario: str, args):
         train_at = value if matched else fixed_at
         train_ds = load_or_create_train(scenario, train_at, n_train, force=args.force_data)
         ckpt = train_one(
-            scenario, train_at, train_ds, epochs, batch_size, out_dir, smoke=args.smoke
+            scenario, train_at, train_ds, epochs, batch_size, out_dir,
+            smoke=args.smoke, arch=arch,
         )
         model_test_ds, generic_test_ds = load_or_create_test(
             scenario, value, n_test, force=args.force_data
@@ -1150,10 +1176,13 @@ def run(scenario: str, args):
             capture_dir=cap_dir if args.capture else None,
             capture_index=args.capture_index,
             subnet_batch=max(1, args.eval_batch),
+            arch=arch,
         )
         row = {sweep: value,
                "train_at": train_at,
                "matched": bool(matched or train_at == value),
+               "arch": arch,
+               "model_type": ARCHS[arch],
                "method_used": ckpt.name}
         # 组合/对角场景的横轴是虚拟量 u，把换算出来的物理配对一并记进结果行，
         # 这样 JSON 自描述 —— 以后翻数据不用回去查 pair_scale 才能复原 σ_g / σ_φ。
@@ -1189,6 +1218,8 @@ def run(scenario: str, args):
             "N": N_SENSORS, "M": M_SOURCES, "T": T_SNAPSHOTS, "snr": SNR_DB,
             "tau": TAU_LAGS, "n_train": n_train, "n_test": n_test,
             "batch_size": batch_size, "epochs": epochs, "lr": LR, "bias": BIAS,
+            # 结构臂 (plan §3.4): 不写进 JSON 的话, 图例/表格只能回头猜这份结果是哪条臂.
+            "arch": arch, "model_type": ARCHS[arch], "init_seed": INIT_SEED,
             "sweep_param": cfg["sweep_param"],
             "shared_array_mismatch": bool(cfg.get("shared_array_mismatch", False)),
             # Γ 的相位规范方式(文档 §17.10): "ramp" = 去掉不可辨识的线性斜坡.
@@ -1239,6 +1270,9 @@ def main():
                         "single: 只训一个模型在整个网格评估 (鲁棒性消融, 见 --train_at)")
     p.add_argument("--train_at", type=float, default=None,
                    help="--train_levels single 时训练所用的失配水平 (默认取场景配置)")
+    p.add_argument("--arch", choices=sorted(ARCHS), default="base",
+                   help="结构臂: base=原论文拓扑; res=加两条加法恒等跳连 "
+                        "(见 src/models_residual.py). 两者参数量/键名相同, 只差拓扑")
     p.add_argument("--grid", type=str, default=None,
                    help="评估失配网格, 逗号分隔, 如 0.025,0.05,0.1,0.15")
     p.add_argument("--algorithms", nargs="+", default=["r-music", "esprit", "music"],
