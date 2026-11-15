@@ -1874,7 +1874,9 @@ Rx = deconv4(DropOut(y1))        (B,  1, 16, 8)
 当前：`python -m pytest tests -q` → **26 passed**；`python preflight_check.py --full` →
 **PASS=28 FAIL=0**（含一次 2 epoch 的真实训练冒烟）。
 
-### 18.5 实测
+### 18.5 实测（80 epoch，种子 1234）
+
+> 40 epoch、三种子的那一组另见 §18.8（种子 1234 已完成，2024/3407 待补）。
 
 协议与 11-02 的 matched 跑法一致：45000 训练 / 5000 测试 / 80 epoch / batch 1024 /
 单种子 1234，gain_phase 的 7 个网格点逐点各训一个模型。本机 RTX 4060 Laptop，单臂约
@@ -1940,17 +1942,64 @@ python tools/analysis/plot_residual_comparison.py \
     --res  data/simulations/results/array_mismatch_gain_phase_20261115_154904.json
 ```
 
-权重名带臂后缀（`..._base.pt` / `..._res.pt`），两臂不会互相覆盖；`--smoke` 的权重再多
-一层 `_smoke`——`train_one` 对已存在的 ckpt 会直接跳过，不加这层后缀，冒烟写出的 3 epoch
-权重会被后面的全量训练当成"训练好了"复用。
+多种子时再加 `--init_seed <N>`（默认 1234）和 `--epochs`，聚合用
+`tools/analysis/plot_residual_seeds.py`，见 §18.8。
+
+权重名带臂后缀与种子（`..._base_s1234.pt` / `..._res_s1234.pt`），两臂、各种子都不会
+互相覆盖；`--smoke` 的权重再多一层 `_smoke`——`train_one` 对已存在的 ckpt 会直接跳过，
+不加这层后缀，冒烟写出的 3 epoch 权重会被后面的全量训练当成"训练好了"复用。
 
 ### 18.7 还没做的
 
 - **单种子**。要回答"残差到底有没有用"至少需要 3 个种子，并沿用同一 `init_seed` 设计，
-  让不同种子之间的方差可比。现在这组数只能当"管线通了、没崩"的证据。
+  让不同种子之间的方差可比。40 epoch 的三种子实验已经起了头（种子 1234 完成，2024/3407
+  留待手动跑），见 §18.8；现在这组 80 epoch 的数只能当"管线通了、没崩"的证据。
 - 只跑了 `gain_phase`。`spacing` 与 `sv_noise_var` 没跑，残差臂在别的失配类型下未必同样
   中性。
 - 计划决策 #8 写的"StepLR 30 epoch × 0.5"与代码不符：实际 `SCHED_STEP=80`、
   `SCHED_GAMMA=0.2`（`reproduce_array_mismatch.py:141-142`），80 epoch 内一次都不衰减。
   这次没改——改了就跟 11-02 不可比；以后要调，两臂必须同时调。
 - `skip_scale` 只做类属性，没有 CLI。消融用测试里的 `skip_scale=0` 即可，不需要重训。
+
+### 18.8 40 epoch 的三种子实验（1/3 完成）
+
+用户判断 80 epoch 可能过拟合，所以另开一组 40 epoch、三颗种子（1234 / 2024 / 3407）、
+两臂各 7 点的实验。先把证据摆出来：验证 loss 没有"训到后面持续回升"的形态——base 第 1 点
+第 20/40/80 轮是 0.0140 / 0.0201 / 0.0073，res 第 1 点是 0.0085 / 0.0067 / 0.0122，都不
+是"越训越差"。所以 40 epoch 是协议选择，不是纠错。
+
+真正和"多训会不会更差"有关的是另一件事：`train_one` 最后 `torch.save` 的是**最后一个
+epoch** 的权重，而 `train_model` 内部按验证 loss 存过的最好权重（`out_dir/<tag>`，无扩展
+名）会被它覆盖。也就是说评估用的从来不是 best-val 模型。以后要动训练循环，先改这里。
+
+为了多种子，`train_one` 现在接受 `--init_seed`，权重名与 JSON 都带种子
+（`..._base_s1234.pt`），不同种子不会互相覆盖——`train_one` 对已存在的 ckpt 是跳过而不是
+覆盖，名字里不带种子会让第二次跑直接复用第一次的权重。
+
+种子 1234、40 epoch 这一对（2026-11-15 21:34 完成，单臂约 52 分钟）：
+
+| u | base | res | 提升 |
+|---:|---:|---:|---:|
+| 0.0 | 0.3185 | 0.4668 | -46.6% |
+| 0.1 | 0.5308 | 0.4645 | +12.5% |
+| 0.2 | 0.5528 | 0.5010 | +9.4% |
+| 0.35 | 0.9031 | 0.7335 | +18.8% |
+| 0.5 | 0.9102 | 1.1786 | -29.5% |
+| 0.75 | 2.4053 | 2.2619 | +6.0% |
+| 1.0 | 5.3588 | 5.2742 | +1.6% |
+| **均值** | **1.5685** | **1.5544** | **+0.9%** |
+
+u=0 与 u=0.5 两个点的大幅反向（-47% / -30%）说明单点差异仍以噪声为主；均值 +0.9% 与
+80 epoch 的 -4.5% 也不能混着读——epoch 与种子同时变了。剩下两颗种子跑完后用：
+
+```bash
+for seed in 2024 3407; do for arch in base res; do
+  python reproduce_array_mismatch.py all --scenario gain_phase --arch "$arch" \
+      --init_seed "$seed" --epochs 40 --device 0 --eval_batch 512 --no_plot
+done; done
+python tools/analysis/plot_residual_seeds.py --epochs 40 --seeds 1234 2024 3407
+```
+
+第二条命令出 `data/simulations/figures/residual_seeds_gain_phase_deg.{png,md}`：左图是
+两臂的均值曲线 ±1 sd（经典 Root-MUSIC 作灰参考），右图是逐点、逐种子的配对提升。三颗
+种子齐了以后先看符号是否一致（每个点上几颗种子偏向同一侧），n=3 时这比 p 值诚实。
