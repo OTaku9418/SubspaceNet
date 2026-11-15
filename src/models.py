@@ -152,6 +152,15 @@ class ModelGenerator(object):
             )
         elif self.model_type.startswith("DeepCNN"):
             self.model = DeepCNN(N=system_model_params.N, grid_size=361)
+        # 注意顺序: "SubspaceNetResidual" 必须是 SubspaceNet 分支之前的 elif,
+        # 否则会被前缀匹配吃掉. 懒加载是为了避免 src.models <-> src.models_residual
+        # 循环导入 (残差臂 import 基类, 基类只在建模型时才 import 残差臂).
+        elif self.model_type.startswith("SubspaceNetResidual"):
+            from src.models_residual import SubspaceNetResidual
+
+            self.model = SubspaceNetResidual(
+                tau=self.tau, M=system_model_params.M, diff_method=self.diff_method
+            )
         elif self.model_type.startswith("SubspaceNet"):
             self.model = SubspaceNet(
                 tau=self.tau, M=system_model_params.M, diff_method=self.diff_method

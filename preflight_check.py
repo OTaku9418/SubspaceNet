@@ -197,6 +197,56 @@ def _params():
     return "tau=8 + 3×(16/32/64) CNN + 3×(128/64/32,1) DCNN + AReLU 通道翻倍 => 41761"
 
 
+@check("残差臂：参数量与键名与基线一致，跳连置 0 时逐位等价")
+def _residual():
+    """守住 A/B 的前提：两臂只差拓扑。
+
+    残差在 `src/models_residual.py`（独立文件），基线 `src/models.py` 的 forward
+    一字未改；`skip_scale=0` 时两边必须逐位相同，否则"只加了跳连"就不成立。
+    """
+    import torch
+    from src.models import SubspaceNet
+    from src.models_residual import SubspaceNetResidual
+    from src.utils import set_unified_seed
+
+    set_unified_seed(1234)
+    base = SubspaceNet(tau=8, M=2, diff_method="root_music")
+    set_unified_seed(1234)
+    res = SubspaceNetResidual(tau=8, M=2, diff_method="root_music")
+    base.eval(), res.eval()
+
+    n = sum(p.numel() for p in res.parameters())
+    assert n == 41761, f"残差臂参数量 {n} != 41761：跳连不该引入任何参数"
+    n_base = sum(p.numel() for p in base.parameters())
+    assert n_base == n, f"两臂参数量不等: {n_base} vs {n}"
+
+    sd_base, sd_res = base.state_dict(), res.state_dict()
+    assert set(sd_base) == set(sd_res), "state_dict 键名不一致：基线权重无法原位加载进残差臂"
+    for key in sd_base:
+        assert sd_base[key].shape == sd_res[key].shape, f"键 {key} 形状不一致"
+    assert "skip_scale" not in sd_res, "跳连系数进了 state_dict，会让权重不再可互换"
+    res.load_state_dict(sd_base)
+    res.skip_scale = 0.0
+
+    def bits(t):
+        t = t.detach().contiguous()
+        if t.is_complex():
+            t = torch.view_as_real(t)
+        return t.view(torch.int32)
+
+    set_unified_seed(7)
+    rx_tau = torch.randn(2, 8, 2 * 8, 8)            # (B, tau, 2N, N)
+    with torch.no_grad():
+        out_base, out_res = base(rx_tau), res(rx_tau)
+    assert torch.equal(bits(out_base[-1]), bits(out_res[-1])), \
+        "skip_scale=0 时 Rz 与基线不逐位相同：跳连位置或尾段实现与基线有漂移"
+    assert torch.equal(bits(out_base[0]), bits(out_res[0])), \
+        "skip_scale=0 时 DoA 预测与基线不逐位相同"
+
+    return ("41761 参数 / 12 键同形 / skip_scale=0 时 Rz 与预测逐位相同，"
+            "skip_scale=1 时确实不同")
+
+
 @check("RMSPE 参考实现相对真实角度的缩放因子 == pi/180")
 def _rmspe():
     import numpy as np
