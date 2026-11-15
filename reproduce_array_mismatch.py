@@ -212,6 +212,7 @@ ARCHS = {"base": "SubspaceNet", "res": "SubspaceNetResidual"}
 # 训练/验证切分、每个 epoch 的 minibatch 顺序、以及 dropout 掩码
 # (torch.manual_seed 对 CPU 与 CUDA 生成器都生效, 已实测). 不设的话, 缓存命中时
 # 两臂的初始权重取决于进程启动的 RNG 状态 => A/B 会混进 20% 量级的种子噪声.
+# 多种子实验用 --init_seed 覆盖; 权重名和 JSON 都会带上这个值, 不同种子不会互相覆盖.
 INIT_SEED = 1234
 
 
@@ -825,12 +826,13 @@ def load_or_create_test(scenario: str, value: float, samples: int, force: bool =
 # 训练
 # ------------------------------------------------------------------------------
 def train_one(scenario: str, value: float, train_ds, epochs: int, batch_size: int,
-              out_dir: Path, smoke: bool = False, arch: str = "base"):
+              out_dir: Path, smoke: bool = False, arch: str = "base",
+              seed: int = INIT_SEED):
     cfg = SCENARIOS[scenario]
     params = params_for(scenario, value)
     # 两臂必须从同一初始权重出发: 见 INIT_SEED 的注释. 只在这里设一次种子,
     # 后面的 optimizer/DataLoader 都从这条随机流里取, 于是两臂的训练轨迹只差拓扑.
-    set_unified_seed(INIT_SEED)
+    set_unified_seed(seed)
     model_config = (
         ModelGenerator()
         .set_model_type(ARCHS[arch])
@@ -839,10 +841,12 @@ def train_one(scenario: str, value: float, train_ds, epochs: int, batch_size: in
         .set_model(params)
     )
     # 权重名带结构臂后缀 (决策 #7): 旧 tag 不含结构, 两条臂会互相覆盖.
-    # smoke 再加一层后缀: train_one 对已存在的 ckpt 会直接跳过, 冒烟写出的 3-epoch
-    # 权重若和正式跑同名, 后面的全量训练会把它当成"已训练好"而复用.
+    # 种子也进名字: 多种子实验会各训一遍, 名字里不带种子就会让第二次跑直接跳过训练
+    # (train_one 对已存在的 ckpt 是跳过, 不是覆盖).
+    # smoke 再加一层后缀: 冒烟写出的 3-epoch 权重若和正式跑同名, 后面的全量训练
+    # 会把它当成"已训练好"而复用.
     tag = f"{scenario}_{cfg['sweep_param']}={value}".replace(".", "p")
-    tag = f"{tag}_{arch}" + ("_smoke" if smoke else "")
+    tag = f"{tag}_{arch}_s{seed}" + ("_smoke" if smoke else "")
     ckpt = out_dir / f"{tag}.pt"
     if ckpt.exists() and not smoke:
         print(f"[model] 权重已存在, 跳过训练: {ckpt.name}")
@@ -1136,8 +1140,9 @@ def run(scenario: str, args):
     arch = getattr(args, "arch", "base")
     if arch not in ARCHS:
         raise ValueError(f"--arch 只能是 {sorted(ARCHS)}, 收到 {arch!r}")
+    seed = int(getattr(args, "init_seed", INIT_SEED))
     matched = args.train_levels == "matched"
-    print(f"[结构] arch={arch} -> {ARCHS[arch]} (初始化种子 {INIT_SEED}, 两臂共用)")
+    print(f"[结构] arch={arch} -> {ARCHS[arch]} (初始化种子 {seed}, 两臂共用)")
     if matched:
         print(f"[协议] 逐点匹配: 网格上每个 {sweep} 各训练一个模型 (忠实复现 Fig.9)")
     else:
@@ -1164,7 +1169,7 @@ def run(scenario: str, args):
         train_ds = load_or_create_train(scenario, train_at, n_train, force=args.force_data)
         ckpt = train_one(
             scenario, train_at, train_ds, epochs, batch_size, out_dir,
-            smoke=args.smoke, arch=arch,
+            smoke=args.smoke, arch=arch, seed=seed,
         )
         model_test_ds, generic_test_ds = load_or_create_test(
             scenario, value, n_test, force=args.force_data
@@ -1219,7 +1224,7 @@ def run(scenario: str, args):
             "tau": TAU_LAGS, "n_train": n_train, "n_test": n_test,
             "batch_size": batch_size, "epochs": epochs, "lr": LR, "bias": BIAS,
             # 结构臂 (plan §3.4): 不写进 JSON 的话, 图例/表格只能回头猜这份结果是哪条臂.
-            "arch": arch, "model_type": ARCHS[arch], "init_seed": INIT_SEED,
+            "arch": arch, "model_type": ARCHS[arch], "init_seed": seed,
             "sweep_param": cfg["sweep_param"],
             "shared_array_mismatch": bool(cfg.get("shared_array_mismatch", False)),
             # Γ 的相位规范方式(文档 §17.10): "ramp" = 去掉不可辨识的线性斜坡.
@@ -1273,6 +1278,9 @@ def main():
     p.add_argument("--arch", choices=sorted(ARCHS), default="base",
                    help="结构臂: base=原论文拓扑; res=加两条加法恒等跳连 "
                         "(见 src/models_residual.py). 两者参数量/键名相同, 只差拓扑")
+    p.add_argument("--init_seed", type=int, default=INIT_SEED,
+                   help="建模型之前的初始化种子 (默认 %(default)s). 两臂共用同一个种子, "
+                        "权重名/JSON 都会带上它; 多种子实验改这里")
     p.add_argument("--grid", type=str, default=None,
                    help="评估失配网格, 逗号分隔, 如 0.025,0.05,0.1,0.15")
     p.add_argument("--algorithms", nargs="+", default=["r-music", "esprit", "music"],
